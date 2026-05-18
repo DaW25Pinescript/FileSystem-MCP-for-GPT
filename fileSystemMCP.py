@@ -10,16 +10,30 @@ import os
 import sys
 import json
 import time
-import shlex
+import argparse
 import subprocess
 from pathlib import Path
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse
 
 PROTOCOL_VERSION = "2024-11-05"
 # Reasonable execution limits for 'shell'
 DEFAULT_TIMEOUT_SEC = 30
+MAX_TIMEOUT_SEC = 300
 MAX_STDOUT_CHARS = 200_000
 MAX_STDERR_CHARS = 200_000
+MAX_FETCH_BYTES = 5 * 1024 * 1024
+SERVER_VERSION = "1.2.0"
+
+TEXT_SUFFIXES = {
+    ".bat", ".cmd", ".css", ".csv", ".env", ".gitignore", ".html", ".ini",
+    ".js", ".json", ".jsx", ".log", ".md", ".ps1", ".py", ".rs", ".sh",
+    ".toml", ".ts", ".tsx", ".txt", ".xml", ".yaml", ".yml",
+}
+SKIP_SEARCH_DIRS = {
+    ".git", ".hg", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".venv",
+    "__pycache__", "build", "dist", "node_modules", "venv",
+}
 
 class MCPSSEHandler(BaseHTTPRequestHandler):
     def __init__(self, allowed_directory: Path, *args, **kwargs):
@@ -46,22 +60,24 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        if self.path == "/sse/":
+        path = self._request_path()
+        if path in ("/sse", "/sse/"):
             self.handle_sse_connection()
-        elif self.path == "/":
+        elif path == "/":
             self._send_json(200, {
                 "jsonrpc": "2.0",
                 "result": {
                     "protocolVersion": PROTOCOL_VERSION,
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "Local Filesystem Server", "version": "1.1.0"},
+                    "serverInfo": {"name": "Local Filesystem Server", "version": SERVER_VERSION},
                 },
             })
         else:
             self.send_error(404, "Not Found")
 
     def do_POST(self):
-        if self.path in ("/", "/sse/"):
+        path = self._request_path()
+        if path in ("/", "/sse", "/sse/"):
             self.handle_mcp_message()
         else:
             self.send_error(404, "Not Found")
@@ -74,7 +90,7 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
         self.end_headers()
-        # Non-initialization notification
+        self.send_sse_event("endpoint", "/")
         self.send_sse_event("message", {
             "jsonrpc": "2.0",
             "method": "notifications/server/ready",
@@ -87,15 +103,19 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
         except Exception:
             pass
 
-    def send_sse_event(self, event_type: str, data: dict):
+    def send_sse_event(self, event_type: str, data):
         try:
             self.wfile.write(f"event: {event_type}\n".encode("utf-8"))
-            self.wfile.write(f"data: {json.dumps(data)}\n\n".encode("utf-8"))
+            payload = data if isinstance(data, str) else json.dumps(data)
+            self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
             self.wfile.flush()
         except Exception:
             pass
 
     # -------- JSON-RPC --------
+    def _request_path(self) -> str:
+        return urlparse(self.path).path
+
     def handle_mcp_message(self):
         message = None
         try:
@@ -109,6 +129,11 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
             raw = self.rfile.read(content_length).decode("utf-8")
             message = json.loads(raw)
             response = self.process_mcp_message(message)
+            if response is None:
+                self.send_response(202)
+                self._send_cors_headers()
+                self.end_headers()
+                return
             self._send_json(200, response)
         except Exception as e:
             msg_id = None
@@ -134,9 +159,12 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
                 "result": {
                     "protocolVersion": PROTOCOL_VERSION,
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "Local Filesystem Server", "version": "1.1.0"},
+                    "serverInfo": {"name": "Local Filesystem Server", "version": SERVER_VERSION},
                 },
             }
+
+        elif method and method.startswith("notifications/"):
+            return None
 
         elif method == "tools/list":
             # Expose Codex-like tools + your originals
@@ -148,13 +176,13 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
                         # --- Codex-style tools ---
                         {
                             "name": "shell",
-                            "description": "Execute shell commands within the allowed workspace (Codex-style)",
+                            "description": "Execute shell commands from a working directory inside the allowed workspace (Codex-style)",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
                                     "command": {
                                         "oneOf": [
-                                            {"type": "string", "description": "Command string (will be shlex-split)"},
+                                            {"type": "string", "description": "Command string (runs through the platform shell)"},
                                             {"type": "array", "items": {"type": "string"}, "description": "Command argv"}
                                         ]
                                     },
@@ -183,7 +211,8 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
-                                    "query": {"type": "string", "description": "Search query (empty = list root)"}
+                                    "query": {"type": "string", "description": "Search query (empty = list root)"},
+                                    "max_results": {"type": "integer", "description": "Maximum results to return (default 50, max 500)"}
                                 },
                                 "required": ["query"]
                             }
@@ -242,7 +271,7 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
                 elif tool_name == "apply_patch":
                     result = self.handle_apply_patch(tool_args.get("patch", ""))
                 elif tool_name == "search":
-                    result = self.handle_search(tool_args.get("query", ""))
+                    result = self.handle_search(tool_args.get("query", ""), tool_args.get("max_results", 50))
                 elif tool_name == "fetch":
                     result = self.handle_fetch(tool_args.get("id", ""))
                 elif tool_name == "write_file":
@@ -285,30 +314,33 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
         if not workdir.exists() or not workdir.is_dir():
             raise ValueError(f"Invalid workdir: {workdir}")
 
-        # Build argv
+        # Build command. String commands intentionally run through the platform
+        # shell so Windows paths and quoting survive the MCP/JSON boundary.
         cmd = args["command"]
         if isinstance(cmd, str):
-            argv = shlex.split(cmd)
+            run_command = cmd
+            shell = True
+            if not cmd.strip():
+                raise ValueError("command cannot be empty")
         elif isinstance(cmd, list):
             if not all(isinstance(x, str) for x in cmd):
                 raise ValueError("command array must contain only strings")
-            argv = cmd
+            run_command = cmd
+            shell = False
+            if not cmd:
+                raise ValueError("command cannot be empty")
         else:
             raise ValueError("command must be string or array of strings")
-        if not argv:
-            raise ValueError("command cannot be empty")
 
-        # Enforce sandbox: only run inside allowed_directory
-        if not str(workdir.resolve()).startswith(str(self.allowed_directory)):
-            raise PermissionError("workdir outside allowed directory")
-
-        timeout = int(args.get("timeout", DEFAULT_TIMEOUT_SEC))
+        timeout = max(1, min(int(args.get("timeout", DEFAULT_TIMEOUT_SEC)), MAX_TIMEOUT_SEC))
         try:
             proc = subprocess.run(
-                argv,
+                run_command,
                 cwd=str(workdir),
                 capture_output=True,
                 text=True,
+                errors="replace",
+                shell=shell,
                 timeout=timeout,
                 env=self._restricted_env(),
             )
@@ -328,65 +360,158 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
 
     def handle_apply_patch(self, patch_text: str) -> dict:
         """
-        Minimal 'apply_patch' compatible with Codex-style patches:
+        Apply the common Codex patch format:
+          *** Add File: path
+          *** Update File: path
+          *** Delete File: path
 
-        Expected shape:
-          *** Begin Patch
-          *** Update File: path/to/file.ext
-          <new file content...>
-          *** End Patch
-
-        Multiple *** Update File sections inside one Begin/End block are supported.
-        We *overwrite* each file's content with the block's body. This mirrors how
-        Codex agents commonly provide full-file replacements rather than hunks.
+        Update hunks use leading " ", "+", and "-" lines. For compatibility
+        with older prompts, an Update section with no hunk markers is treated as
+        a full-file replacement.
         """
-        if not patch_text or "*** Begin Patch" not in patch_text:
-            raise ValueError("Patch missing '*** Begin Patch'")
+        lines = patch_text.splitlines(keepends=True)
+        if not lines or not lines[0].strip() == "*** Begin Patch":
+            raise ValueError("Patch must start with '*** Begin Patch'")
 
-        updated = []
-        begin = "*** Begin Patch"
-        end = "*** End Patch"
-        update_hdr = "*** Update File:"
+        changed = {"added": [], "updated": [], "deleted": [], "moved": []}
+        idx = 1
 
-        # We allow multiple Begin/End blocks; process each independently
-        idx = 0
-        while True:
-            start = patch_text.find(begin, idx)
-            if start == -1:
-                break
-            stop = patch_text.find(end, start)
-            if stop == -1:
-                raise ValueError("Unclosed patch block (missing '*** End Patch')")
-            block = patch_text[start + len(begin):stop].strip("\n")
-            idx = stop + len(end)
+        while idx < len(lines):
+            current = lines[idx].rstrip("\r\n")
+            if current == "*** End Patch":
+                return {"success": True, **changed}
 
-            # Parse all "*** Update File: <path>" sections in this block
-            pos = 0
-            while True:
-                uh = block.find(update_hdr, pos)
-                if uh == -1:
-                    break
-                # find next update or end
-                next_uh = block.find(update_hdr, uh + len(update_hdr))
-                file_block = block[uh: next_uh if next_uh != -1 else len(block)]
-                # Extract path first line
-                first_line_end = file_block.find("\n")
-                if first_line_end == -1:
-                    raise ValueError("Malformed update header (no newline after file path)")
-                header = file_block[:first_line_end].strip()
-                if not header.startswith(update_hdr):
-                    raise ValueError("Malformed update header")
-                rel_path = header[len(update_hdr):].strip()
-                # remaining lines are the new file content
-                new_content = file_block[first_line_end + 1:]
-                # Write file safely
+            if current.startswith("*** Add File:"):
+                rel_path = current[len("*** Add File:"):].strip()
+                idx += 1
+                body = []
+                while idx < len(lines) and not self._is_patch_header(lines[idx]):
+                    if not lines[idx].startswith("+"):
+                        raise ValueError(f"Add File lines must start with '+': {rel_path}")
+                    body.append(lines[idx][1:])
+                    idx += 1
                 file_path = self.validate_path(rel_path)
+                if file_path.exists():
+                    raise FileExistsError(f"File already exists: {rel_path}")
                 file_path.parent.mkdir(parents=True, exist_ok=True)
-                file_path.write_text(new_content, encoding="utf-8")
-                updated.append(str(file_path.relative_to(self.allowed_directory)))
-                pos = next_uh if next_uh != -1 else len(block)
+                file_path.write_text("".join(body), encoding="utf-8", newline="")
+                changed["added"].append(self._relative_id(file_path))
+                continue
 
-        return {"success": True, "updated": updated}
+            if current.startswith("*** Delete File:"):
+                rel_path = current[len("*** Delete File:"):].strip()
+                file_path = self.validate_path(rel_path)
+                if not file_path.exists() or not file_path.is_file():
+                    raise FileNotFoundError(f"File not found: {rel_path}")
+                file_path.unlink()
+                changed["deleted"].append(self._relative_id(file_path))
+                idx += 1
+                continue
+
+            if current.startswith("*** Update File:"):
+                rel_path = current[len("*** Update File:"):].strip()
+                source_path = self.validate_path(rel_path)
+                if not source_path.exists() or not source_path.is_file():
+                    raise FileNotFoundError(f"File not found: {rel_path}")
+                idx += 1
+
+                move_to = None
+                if idx < len(lines) and lines[idx].startswith("*** Move to:"):
+                    move_to = lines[idx].rstrip("\r\n")[len("*** Move to:"):].strip()
+                    idx += 1
+
+                section = []
+                while idx < len(lines) and not self._is_patch_header(lines[idx]):
+                    section.append(lines[idx])
+                    idx += 1
+
+                text = source_path.read_text(encoding="utf-8", errors="replace")
+                if self._looks_like_hunk(section):
+                    new_text = self._apply_update_hunks(text, section, rel_path)
+                else:
+                    new_text = "".join(section)
+
+                target_path = self.validate_path(move_to) if move_to else source_path
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                target_path.write_text(new_text, encoding="utf-8", newline="")
+                if move_to and target_path != source_path:
+                    source_path.unlink()
+                    changed["moved"].append({"from": self._relative_id(source_path), "to": self._relative_id(target_path)})
+                else:
+                    changed["updated"].append(self._relative_id(target_path))
+                continue
+
+            raise ValueError(f"Unknown patch header: {current}")
+
+        raise ValueError("Unclosed patch block (missing '*** End Patch')")
+
+    def _is_patch_header(self, line: str) -> bool:
+        stripped = line.rstrip("\r\n")
+        return stripped == "*** End Patch" or stripped.startswith((
+            "*** Add File:", "*** Update File:", "*** Delete File:", "*** Move to:",
+        ))
+
+    def _looks_like_hunk(self, section: list[str]) -> bool:
+        saw_marker = False
+        saw_edit = False
+        for line in section:
+            if not line.strip():
+                continue
+            if line.startswith("@@"):
+                return True
+            marker = line[:1]
+            if marker in (" ", "+", "-"):
+                saw_marker = True
+                saw_edit = saw_edit or marker in ("+", "-")
+                continue
+            return False
+        return saw_marker and saw_edit
+
+    def _apply_update_hunks(self, original_text: str, section: list[str], rel_path: str) -> str:
+        content = original_text.splitlines(keepends=True)
+        cursor = 0
+        idx = 0
+
+        while idx < len(section):
+            if section[idx].startswith("@@"):
+                idx += 1
+                continue
+
+            old = []
+            new = []
+            while True:
+                if idx >= len(section) or section[idx].startswith("@@"):
+                    break
+                line = section[idx]
+                marker = line[:1]
+                if marker == " ":
+                    old.append(line[1:])
+                    new.append(line[1:])
+                elif marker == "-":
+                    old.append(line[1:])
+                elif marker == "+":
+                    new.append(line[1:])
+                elif line.startswith("\\ No newline at end of file"):
+                    pass
+                else:
+                    raise ValueError(f"Malformed hunk line in {rel_path}: {line.rstrip()}")
+                idx += 1
+
+            position = self._find_subsequence(content, old, cursor)
+            if position is None:
+                raise ValueError(f"Patch context not found in {rel_path}")
+            content[position:position + len(old)] = new
+            cursor = position + len(new)
+
+        return "".join(content)
+
+    def _find_subsequence(self, content: list[str], needle: list[str], start: int):
+        if not needle:
+            return start
+        for pos in range(start, len(content) - len(needle) + 1):
+            if content[pos:pos + len(needle)] == needle:
+                return pos
+        return None
 
     def _restricted_env(self):
         """Environment stripped down; PATH preserved for common tools."""
@@ -398,9 +523,10 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
         return env
 
     # -------- Filesystem tools --------
-    def handle_search(self, query: str) -> dict:
+    def handle_search(self, query: str, max_results: int = 50) -> dict:
         results = []
         q = (query or "").lower().strip()
+        limit = max(1, min(int(max_results or 50), 500))
         if not q:
             target = self.allowed_directory
             if target.exists() and target.is_dir():
@@ -408,14 +534,23 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
                     rel = item.relative_to(self.allowed_directory)
                     results.append({"id": str(rel), "title": f"{'[DIR] ' if item.is_dir() else ''}{item.name}", "url": f"file://{item.resolve()}"})
         else:
-            for path in self.allowed_directory.rglob("*"):
-                try:
-                    rel = path.relative_to(self.allowed_directory)
-                    if q in path.name.lower() or q in str(rel).lower():
-                        results.append({"id": str(rel), "title": f"{'[DIR] ' if path.is_dir() else ''}{path.name}", "url": f"file://{path.resolve()}"})
-                except Exception:
-                    continue
-        return {"results": results[:20]}
+            for dirpath, dirnames, filenames in os.walk(self.allowed_directory):
+                dirnames[:] = sorted(
+                    [name for name in dirnames if name not in SKIP_SEARCH_DIRS],
+                    key=str.lower,
+                )
+                entries = [(name, True) for name in dirnames] + [(name, False) for name in sorted(filenames, key=str.lower)]
+                for name, is_dir in entries:
+                    path = Path(dirpath) / name
+                    try:
+                        rel = path.relative_to(self.allowed_directory)
+                        if q in name.lower() or q in str(rel).lower():
+                            results.append({"id": str(rel), "title": f"{'[DIR] ' if is_dir else ''}{name}", "url": f"file://{path.resolve()}"})
+                            if len(results) >= limit:
+                                return {"results": results}
+                    except Exception:
+                        continue
+        return {"results": results[:limit]}
 
     def handle_fetch(self, file_id: str) -> dict:
         if not file_id:
@@ -429,12 +564,15 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
                 items.append(f"{'[DIR] ' if item.is_dir() else ''}{item.name}")
             content = f"Directory: {file_id}\n\nContents:\n" + "\n".join(items)
             return {"id": file_id, "title": path.name, "text": content, "url": f"file://{path.resolve()}", "metadata": {"type": "directory"}}
-        if path.stat().st_size > 1024 * 1024:
-            raise ValueError("File too large (limit 1MB)")
+        if path.stat().st_size > MAX_FETCH_BYTES:
+            raise ValueError(f"File too large (limit {MAX_FETCH_BYTES // (1024 * 1024)}MB)")
         try:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
-            text = f"[Binary file: {path.suffix or 'unknown'}]"
+            if path.suffix.lower() in TEXT_SUFFIXES:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            else:
+                text = f"[Binary file: {path.suffix or 'unknown'}]"
         return {"id": file_id, "title": path.name, "text": text, "url": f"file://{path.resolve()}", "metadata": {"type": "file", "size": path.stat().st_size}}
 
     def handle_write_file(self, dest: str, content: str) -> dict:
@@ -467,10 +605,21 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
 
     # -------- security --------
     def validate_path(self, user_path: str) -> Path:
+        if not isinstance(user_path, str) or not user_path.strip():
+            raise ValueError("Path must be a non-empty string")
         abs_path = Path(user_path).resolve() if os.path.isabs(user_path) else (self.allowed_directory / user_path).resolve()
-        if not str(abs_path).startswith(str(self.allowed_directory)):
+        try:
+            abs_path.relative_to(self.allowed_directory)
+        except ValueError:
             raise PermissionError("Path outside allowed directory")
         return abs_path
+
+    def _relative_id(self, path: Path) -> str:
+        return str(path.resolve().relative_to(self.allowed_directory))
+
+
+class MCPHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
 
 
 def create_handler(allowed_directory: Path):
@@ -480,20 +629,22 @@ def create_handler(allowed_directory: Path):
 
 
 def main():
-    if len(sys.argv) != 2:
-        print("Usage: python3 basic_mcp_server.py <directory_path>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Local filesystem MCP server for ChatGPT/Codex-style workflows.")
+    parser.add_argument("directory", help="Directory the server is allowed to access")
+    parser.add_argument("--host", default="localhost", help="Host interface to bind (default: localhost)")
+    parser.add_argument("--port", type=int, default=8000, help="Port to listen on (default: 8000)")
+    args = parser.parse_args()
 
-    allowed_directory = Path(sys.argv[1]).resolve()
+    allowed_directory = Path(args.directory).resolve()
     if not allowed_directory.exists() or not allowed_directory.is_dir():
         print(f"Error: {allowed_directory} is not a valid directory")
         sys.exit(1)
 
     print(f"Starting MCP server restricted to: {allowed_directory}")
-    print("Server URL: http://localhost:8000")
-    print("SSE URL for ChatGPT: http://localhost:8000/sse/")
+    print(f"Server URL: http://{args.host}:{args.port}")
+    print(f"SSE URL for ChatGPT: http://{args.host}:{args.port}/sse/")
 
-    with HTTPServer(("localhost", 8000), create_handler(allowed_directory)) as server:
+    with MCPHTTPServer((args.host, args.port), create_handler(allowed_directory)) as server:
         print("Server started. Use Ctrl+C to stop.")
         try:
             server.serve_forever()

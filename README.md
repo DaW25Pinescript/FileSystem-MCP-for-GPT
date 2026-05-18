@@ -1,175 +1,120 @@
-
 # MCP Filesystem + Codex-Style Server
 
-This is a **Model Context Protocol (MCP) server** that exposes a set of tools for interacting with your local filesystem and running Codex-style developer workflows.
+This is a small, dependency-free MCP-style HTTP/SSE server for giving ChatGPT controlled access to a local workspace.
 
-It supports **basic file management**, **patch application**, and **shell execution** inside a sandboxed directory, making it compatible with ChatGPT configured as an MCP server.
+It is designed for local repo work: inspect files, write fixes, apply Codex-style patches, and run shell commands with the working directory restricted to a chosen root.
 
----
+## Features
 
-## 🚀 Features & Tools
+- `shell`: run commands from a workspace directory. String commands use the platform shell, so Windows paths like `C:\Python314\python.exe` are preserved.
+- `apply_patch`: apply Codex-style `*** Begin Patch` patches with add, update, delete, move, and normal `+`/`-` hunks.
+- `search`: find files and directories, with common noisy folders such as `.git`, `.venv`, `node_modules`, and caches skipped.
+- `fetch`: read files or list directories. Known text files such as Markdown fall back to replacement decoding instead of being misclassified as binary after one bad byte.
+- `write_file`, `create_directory`, `delete_file`: basic filesystem mutation tools.
+- Threaded HTTP/SSE handling so a long-lived SSE connection does not block tool POSTs.
 
-### Codex-Style Tools
+## Requirements
 
-* **`shell`** – Execute shell commands in a sandboxed directory.
-* **`apply_patch`** – Apply Codex-style multi-file patches (`*** Begin Patch` / `*** Update File:` / `*** End Patch`).
+- Python 3.9+
+- No third-party packages
 
-### Filesystem Tools
+## Run Locally
 
-* **`search`** – Search for files or list the root directory.
-* **`fetch`** – Fetch file contents or list directory contents.
-* **`write_file`** – Write a UTF-8 text file (creates parent dirs if needed).
-* **`create_directory`** – Create a directory (with parents).
-* **`delete_file`** – Delete a file or directory (recursive).
-
----
-
-## How to use
-
-
-## 📦 Installation
-
-Clone this repo and make the script executable:
-
-```bash
-git clone <your-repo-url>
-cd <your-repo>
-chmod +x fileSystemMCP.py
+```powershell
+python fileSystemMCP.py D:\GitHub --port 8000
 ```
 
-Requires **Python 3.9+** (tested on 3.10/3.11).
+For a narrower workspace:
 
-No third-party dependencies are required (uses only the Python standard library).
-
----
-
-## ▶️ Running the Server
-
-Run the server, restricted to a chosen working directory:
-
-```bash
-pip install fastmcp
-python3 fileSystemMCP.py /path/to/your/workspace
+```powershell
+python fileSystemMCP.py D:\GitHub\pine_python --port 8000
 ```
 
-Example:
+The server prints:
 
-```bash
-python3 fileSystemMCP.py ~/projects/demo
-```
-
-You’ll see:
-
-```
-Starting MCP server restricted to: /Users/you/projects/demo
+```text
+Starting MCP server restricted to: D:\GitHub
 Server URL: http://localhost:8000
 SSE URL for ChatGPT: http://localhost:8000/sse/
 Server started. Use Ctrl+C to stop.
 ```
 
----
+Optional flags:
 
+```text
+--host HOST    Bind interface, default localhost
+--port PORT    Listen port, default 8000
+```
 
-### 🌐 Exposing the Server to the Web
+## Expose to ChatGPT
 
-To use this as an MCP server with **ChatGPT** (or other cloud-based clients), you need to make it accessible from the internet. The easiest way is with [ngrok](https://ngrok.com/):
+Cloud ChatGPT cannot reach `localhost` directly. Use a tunnel such as ngrok:
 
-1. [Install ngrok](https://ngrok.com/download) and log in.
+```powershell
+ngrok http 8000
+```
 
-2. Forward your local server:
+Add the HTTPS forwarding URL in ChatGPT's custom MCP server settings, usually with `/sse/` appended:
 
-   ```bash
-   ngrok http 8000
-   ```
+```text
+https://example.ngrok-free.app/sse/
+```
 
-3. You’ll see an HTTPS forwarding URL, e.g.:
+Security note: this server exposes local file editing and shell execution. File tools enforce the allowed root, and `shell` requires a working directory inside that root, but your operating system shell is not a complete sandbox. Only run it for directories you are comfortable exposing to the connected assistant, and stop the tunnel when you are done.
 
-   ```
-   Forwarding https://88952b488500.ngrok-free.app -> http://localhost:8000
-   ```
+## Tool Notes
 
-   Your server is now publicly reachable at that URL.
+### `shell`
 
----
+Arguments:
 
-### 🔗 Linking with ChatGPT as an MCP Server
+- `command`: string or argv array
+- `workdir`: relative or absolute path inside the allowed root
+- `timeout`: optional seconds, clamped to 1-300
 
-1. Open ChatGPT settings → **Custom MCP Servers**.
-2. Add a new MCP server with:
+String commands run through the platform shell. This is intentional for Windows compatibility:
 
-   * **Name**: `filesystem`
-   * **URL**: the ngrok HTTPS URL (e.g. `https://88952b488500.ngrok-free.app/sse/`)
-   * **Capabilities**: leave defaults.
-3. Save and enable.
+```json
+{
+  "command": "cmd /c C:\\Python314\\python.exe -m pytest tests -v",
+  "workdir": "D:\\GitHub\\pine_python",
+  "timeout": 120
+}
+```
 
-ChatGPT will now handshake with your MCP server and discover all 7 tools.
+Use an argv array when you want no shell interpolation.
 
----
+### `apply_patch`
 
+Supports standard Codex-style patches:
 
-## Tools
+```text
+*** Begin Patch
+*** Update File: example.txt
+@@
+ old line
+-bad line
++good line
+ next line
+*** End Patch
+```
 
-### 🔧 Codex-style AI tools
+Also supports `*** Add File:`, `*** Delete File:`, and `*** Move to:` inside update sections.
 
-1. **`shell`**
-   Execute shell commands within the allowed workspace.
+### `search`
 
-   * **Arguments**:
+Arguments:
 
-     * `command`: string or array of strings
-     * `workdir`: working directory (relative or absolute inside allowed root)
-     * `timeout`: optional integer (seconds)
-   * **Returns**: exit code, stdout, stderr, timeout flag (mirrors Codex CLI behavior).
+- `query`: search text; empty lists the allowed root
+- `max_results`: optional, default 50, max 500
 
-2. **`apply_patch`**
-   Apply a multi-file patch in the Codex `*** Begin Patch` / `*** Update File: <path>` / `*** End Patch` format.
+### `fetch`
 
-   * **Arguments**:
+Files up to 5 MB are returned as text when possible. Directories return a simple sorted listing.
 
-     * `patch`: string containing one or more patch blocks
-   * **Returns**: list of updated file paths.
+## Test
 
----
-
-### 📁 Filesystem tools
-
-3. **`search`**
-   Search for files and directories (or list root if query is empty).
-
-   * **Arguments**:
-
-     * `query`: string
-   * **Returns**: up to 20 matches with `id`, `title`, `url`.
-
-4. **`fetch`**
-   Fetch file contents or list directory contents.
-
-   * **Arguments**:
-
-     * `id`: file or directory path (relative or absolute inside allowed root)
-   * **Returns**: file text (if <1 MB) or directory listing, plus metadata.
-
-5. **`write_file`**
-   Write a UTF-8 text file, creating parent directories if needed.
-
-   * **Arguments**:
-
-     * `path`: file path
-     * `content`: string
-   * **Returns**: confirmation with size written.
-
-6. **`create_directory`**
-   Create a directory (and parents) inside allowed root.
-
-   * **Arguments**:
-
-     * `path`: directory path
-   * **Returns**: confirmation with path.
-
-7. **`delete_file`**
-   Delete a file or a directory (recursively).
-
-   * **Arguments**:
-
-     * `path`: path to file/directory
-   * **Returns**: confirmation with type of deleted item.
+```powershell
+python -m unittest -v
+python -m py_compile fileSystemMCP.py test_fileSystemMCP.py
+```
