@@ -11,7 +11,10 @@ import sys
 import json
 import time
 import argparse
+import platform
+import shutil
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
@@ -23,7 +26,7 @@ MAX_TIMEOUT_SEC = 300
 MAX_STDOUT_CHARS = 200_000
 MAX_STDERR_CHARS = 200_000
 MAX_FETCH_BYTES = 5 * 1024 * 1024
-SERVER_VERSION = "1.2.0"
+SERVER_VERSION = "1.3.1"
 
 TEXT_SUFFIXES = {
     ".bat", ".cmd", ".css", ".csv", ".env", ".gitignore", ".html", ".ini",
@@ -34,17 +37,21 @@ SKIP_SEARCH_DIRS = {
     ".git", ".hg", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".venv",
     "__pycache__", "build", "dist", "node_modules", "venv",
 }
+DEFAULT_BLOCKED_COMMANDS = ("rm -rf", "rmdir /s", "del /s", "format ")
+AUDIT_LOG_NAME = ".mcp_audit.log"
+QUARANTINE_DIR_NAME = ".mcp_trash"
 
 class MCPSSEHandler(BaseHTTPRequestHandler):
-    def __init__(self, allowed_directory: Path, *args, **kwargs):
+    def __init__(self, allowed_directory: Path, config: dict | None = None, *args, **kwargs):
         self.allowed_directory = allowed_directory
+        self.config = config or {}
         super().__init__(*args, **kwargs)
 
     # -------- utilities --------
     def _send_cors_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-MCP-Auth")
 
     def _send_json(self, status: int, payload: dict):
         self.send_response(status)
@@ -53,13 +60,50 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(payload).encode("utf-8"))
 
+    def _request_allowed(self) -> bool:
+        origin = self.headers.get("Origin")
+        allowed_origins = set(self.config.get("allowed_origins") or [])
+        if origin and not self._origin_allowed(origin, allowed_origins):
+            self._send_json(403, {
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {"code": -32003, "message": f"Forbidden Origin: {origin}"},
+            })
+            return False
+
+        token = self.config.get("auth_token")
+        if token:
+            auth = self.headers.get("Authorization", "")
+            header_token = self.headers.get("X-MCP-Auth", "")
+            if auth != f"Bearer {token}" and header_token != token:
+                self._send_json(401, {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32004, "message": "Missing or invalid MCP auth token"},
+                })
+                return False
+        return True
+
+    def _origin_allowed(self, origin: str, allowed_origins: set[str]) -> bool:
+        if origin in allowed_origins:
+            return True
+        parsed_origin = urlparse(origin)
+        host = (parsed_origin.hostname or "").lower()
+        if host in {"localhost", "127.0.0.1", "::1"}:
+            return True
+        return False
+
     # -------- HTTP verbs --------
     def do_OPTIONS(self):
+        if not self._request_allowed():
+            return
         self.send_response(204)
         self._send_cors_headers()
         self.end_headers()
 
     def do_GET(self):
+        if not self._request_allowed():
+            return
         path = self._request_path()
         if path in ("/sse", "/sse/"):
             self.handle_sse_connection()
@@ -76,8 +120,10 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
             self.send_error(404, "Not Found")
 
     def do_POST(self):
+        if not self._request_allowed():
+            return
         path = self._request_path()
-        if path in ("/", "/sse", "/sse/"):
+        if path in ("/", "/mcp", "/sse", "/sse/"):
             self.handle_mcp_message()
         else:
             self.send_error(404, "Not Found")
@@ -167,110 +213,27 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
             return None
 
         elif method == "tools/list":
-            # Expose Codex-like tools + your originals
             return {
                 "jsonrpc": "2.0",
                 "id": msg_id,
-                "result": {
-                    "tools": [
-                        # --- Codex-style tools ---
-                        {
-                            "name": "shell",
-                            "description": "Execute shell commands from a working directory inside the allowed workspace (Codex-style)",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "command": {
-                                        "oneOf": [
-                                            {"type": "string", "description": "Command string (runs through the platform shell)"},
-                                            {"type": "array", "items": {"type": "string"}, "description": "Command argv"}
-                                        ]
-                                    },
-                                    "workdir": {"type": "string", "description": "Working directory (relative or absolute within allowed root)"},
-                                    "timeout": {"type": "integer", "description": "Timeout (seconds)"}
-                                },
-                                "required": ["command", "workdir"]
-                            }
-                        },
-                        {
-                            "name": "apply_patch",
-                            "description": "Apply a multi-file patch in the common Codex '*** Begin Patch' format",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "patch": {"type": "string", "description": "Patch text (*** Begin Patch / *** Update File: path / *** End Patch)"},
-                                },
-                                "required": ["patch"]
-                            }
-                        },
-
-                        # --- Filesystem tools you already had ---
-                        {
-                            "name": "search",
-                            "description": "Search for files and directories",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "query": {"type": "string", "description": "Search query (empty = list root)"},
-                                    "max_results": {"type": "integer", "description": "Maximum results to return (default 50, max 500)"}
-                                },
-                                "required": ["query"]
-                            }
-                        },
-                        {
-                            "name": "fetch",
-                            "description": "Fetch file or directory contents",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "id": {"type": "string", "description": "File or directory path"}
-                                },
-                                "required": ["id"]
-                            }
-                        },
-                        {
-                            "name": "write_file",
-                            "description": "Write a UTF-8 text file (creates parents)",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "path": {"type": "string"},
-                                    "content": {"type": "string"}
-                                },
-                                "required": ["path", "content"]
-                            }
-                        },
-                        {
-                            "name": "create_directory",
-                            "description": "Create a directory (and parents)",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {"path": {"type": "string"}},
-                                "required": ["path"]
-                            }
-                        },
-                        {
-                            "name": "delete_file",
-                            "description": "Delete a file or directory (recursive for directories)",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {"path": {"type": "string"}},
-                                "required": ["path"]
-                            }
-                        }
-                    ]
-                }
+                "result": {"tools": self.tool_definitions()}
             }
 
         elif method == "tools/call":
             tool_name = params.get("name")
             tool_args = params.get("arguments", {}) or {}
             try:
-                if tool_name == "shell":
+                if tool_name == "status":
+                    result = self.handle_status(bool(tool_args.get("verbose", False)))
+                elif tool_name == "shell":
                     result = self.handle_shell(tool_args)
                 elif tool_name == "apply_patch":
-                    result = self.handle_apply_patch(tool_args.get("patch", ""))
+                    result = self.handle_apply_patch(tool_args.get("patch", ""), self._bool_arg(tool_args, "dry_run", "dryRun"))
+                elif tool_name == "apply_patch_dry_run":
+                    result = self.handle_apply_patch(tool_args.get("patch", ""), True)
                 elif tool_name == "search":
+                    result = self.handle_search(tool_args.get("query", ""), self._arg(tool_args, "max_results", "maxResults", default=50))
+                elif tool_name == "search_limited":
                     result = self.handle_search(tool_args.get("query", ""), tool_args.get("max_results", 50))
                 elif tool_name == "fetch":
                     result = self.handle_fetch(tool_args.get("id", ""))
@@ -279,26 +242,413 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
                 elif tool_name == "create_directory":
                     result = self.handle_create_directory(tool_args.get("path", ""))
                 elif tool_name == "delete_file":
-                    result = self.handle_delete_file(tool_args.get("path", ""))
+                    result = self.handle_delete_file(
+                        tool_args.get("path", ""),
+                        dry_run=self._bool_arg(tool_args, "dry_run", "dryRun"),
+                        mode=tool_args.get("mode", "quarantine"),
+                        confirm_recursive=self._bool_arg(tool_args, "confirm_recursive", "confirmRecursive"),
+                    )
+                elif tool_name == "delete_file_dry_run":
+                    result = self.handle_delete_file(tool_args.get("path", ""), dry_run=True)
+                elif tool_name == "delete_file_permanent":
+                    result = self.handle_delete_file(
+                        tool_args.get("path", ""),
+                        dry_run=False,
+                        mode="permanent",
+                        confirm_recursive=self._bool_arg(tool_args, "confirm_recursive", "confirmRecursive"),
+                    )
                 else:
                     return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"}}
 
-                return {
-                    "jsonrpc": "2.0",
-                    "id": msg_id,
-                    "result": {
-                        "content": [
-                            {"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2), "mimeType": "application/json"}
-                        ]
-                    }
-                }
+                return self._tool_response(msg_id, result)
             except Exception as e:
-                return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32000, "message": str(e)}}
+                return self._tool_response(msg_id, {"success": False, "error": str(e), "tool": tool_name}, is_error=True)
 
         else:
             return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": f"Unknown method: {method}"}}
 
+    def _tool_response(self, msg_id, structured: dict, is_error: bool = False) -> dict:
+        result = {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(structured, ensure_ascii=False, indent=2),
+                    "mimeType": "application/json",
+                }
+            ],
+            "structuredContent": structured,
+        }
+        if is_error:
+            result["isError"] = True
+        return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+    def _arg(self, args: dict, snake_name: str, camel_name: str, default=None):
+        if snake_name in args:
+            return args[snake_name]
+        if camel_name in args:
+            return args[camel_name]
+        return default
+
+    def _bool_arg(self, args: dict, snake_name: str, camel_name: str, default: bool = False) -> bool:
+        return bool(self._arg(args, snake_name, camel_name, default))
+
+    def tool_definitions(self) -> list[dict]:
+        ok_schema = {"type": "boolean"}
+        text_schema = {"type": "string"}
+        path_result_schema = {
+            "type": "object",
+            "properties": {"success": ok_schema, "message": text_schema, "path": text_schema},
+            "required": ["success", "path"],
+            "additionalProperties": True,
+        }
+        return [
+            {
+                "name": "status",
+                "title": "Server Status",
+                "description": "Return MCP server diagnostics, limits, workspace root, and runtime availability.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "verbose": {"type": "boolean", "description": "Include extended diagnostics when true", "default": False},
+                    },
+                    "additionalProperties": False,
+                },
+                "outputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "success": ok_schema,
+                        "serverVersion": text_schema,
+                        "protocolVersion": text_schema,
+                        "allowedRoot": text_schema,
+                        "availableTools": {"type": "array", "items": text_schema},
+                    },
+                    "required": ["success", "serverVersion", "allowedRoot", "availableTools"],
+                    "additionalProperties": True,
+                },
+                "annotations": {"title": "Server Status", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+            },
+            {
+                "name": "shell",
+                "title": "Run Shell Command",
+                "description": "Execute a command from a working directory inside the allowed root. String commands run through the platform shell.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "oneOf": [
+                                {"type": "string", "description": "Command string run through the platform shell"},
+                                {"type": "array", "items": {"type": "string"}, "description": "Command argv without shell interpolation"},
+                            ]
+                        },
+                        "workdir": {"type": "string", "description": "Working directory inside the allowed root"},
+                        "timeout": {"type": "integer", "description": "Timeout seconds", "default": DEFAULT_TIMEOUT_SEC, "minimum": 1, "maximum": MAX_TIMEOUT_SEC},
+                    },
+                    "required": ["command", "workdir"],
+                    "additionalProperties": False,
+                },
+                "outputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "ok": ok_schema,
+                        "exitCode": {"type": ["integer", "null"]},
+                        "timedOut": ok_schema,
+                        "stdout": text_schema,
+                        "stderr": text_schema,
+                    },
+                    "required": ["ok", "exitCode", "timedOut", "stdout", "stderr"],
+                    "additionalProperties": False,
+                },
+                "annotations": {"title": "Run Shell Command", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
+            },
+            {
+                "name": "apply_patch",
+                "title": "Apply Patch",
+                "description": "Apply a Codex-style patch. Use dry_run to validate without writing files.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "patch": {"type": "string", "description": "Patch text beginning with *** Begin Patch"},
+                        "dry_run": {"type": "boolean", "description": "Validate and preview changes without writing", "default": False},
+                    },
+                    "required": ["patch"],
+                    "additionalProperties": False,
+                },
+                "outputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "success": ok_schema,
+                        "dryRun": ok_schema,
+                        "added": {"type": "array", "items": text_schema},
+                        "updated": {"type": "array", "items": text_schema},
+                        "deleted": {"type": "array", "items": text_schema},
+                        "moved": {"type": "array", "items": {"type": "object"}},
+                    },
+                    "required": ["success", "dryRun", "added", "updated", "deleted", "moved"],
+                    "additionalProperties": False,
+                },
+                "annotations": {"title": "Apply Patch", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
+            },
+            {
+                "name": "apply_patch_dry_run",
+                "title": "Preview Patch",
+                "description": "Validate a Codex-style patch and preview affected files without writing changes. Compatibility alias for clients that hide optional parameters.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"patch": {"type": "string", "description": "Patch text beginning with *** Begin Patch"}},
+                    "required": ["patch"],
+                    "additionalProperties": False,
+                },
+                "outputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "success": ok_schema,
+                        "dryRun": ok_schema,
+                        "added": {"type": "array", "items": text_schema},
+                        "updated": {"type": "array", "items": text_schema},
+                        "deleted": {"type": "array", "items": text_schema},
+                        "moved": {"type": "array", "items": {"type": "object"}},
+                    },
+                    "required": ["success", "dryRun", "added", "updated", "deleted", "moved"],
+                    "additionalProperties": False,
+                },
+                "annotations": {"title": "Preview Patch", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+            },
+            {
+                "name": "search",
+                "title": "Search Files",
+                "description": "Search for files and directories. Optional max_results defaults to 50 and is capped at 500.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Search query; empty lists the allowed root"},
+                        "max_results": {"type": "integer", "description": "Maximum results to return", "default": 50, "minimum": 1, "maximum": 500},
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+                "outputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "results": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {"id": text_schema, "title": text_schema, "url": text_schema},
+                                "required": ["id", "title", "url"],
+                                "additionalProperties": False,
+                            },
+                        }
+                    },
+                    "required": ["results"],
+                    "additionalProperties": False,
+                },
+                "annotations": {"title": "Search Files", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+            },
+            {
+                "name": "search_limited",
+                "title": "Search Files Limited",
+                "description": "Search files and directories with an explicit result limit. Compatibility alias for clients that hide optional parameters.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Search query; empty lists the allowed root"},
+                        "max_results": {"type": "integer", "description": "Maximum results to return", "default": 50, "minimum": 1, "maximum": 500},
+                    },
+                    "required": ["query", "max_results"],
+                    "additionalProperties": False,
+                },
+                "outputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "results": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {"id": text_schema, "title": text_schema, "url": text_schema},
+                                "required": ["id", "title", "url"],
+                                "additionalProperties": False,
+                            },
+                        }
+                    },
+                    "required": ["results"],
+                    "additionalProperties": False,
+                },
+                "annotations": {"title": "Search Files Limited", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+            },
+            {
+                "name": "fetch",
+                "title": "Fetch File",
+                "description": "Fetch file contents or list a directory inside the allowed root.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"id": {"type": "string", "description": "File or directory path inside the allowed root"}},
+                    "required": ["id"],
+                    "additionalProperties": False,
+                },
+                "outputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": text_schema,
+                        "title": text_schema,
+                        "text": text_schema,
+                        "url": text_schema,
+                        "metadata": {"type": "object"},
+                    },
+                    "required": ["id", "title", "text", "url", "metadata"],
+                    "additionalProperties": False,
+                },
+                "annotations": {"title": "Fetch File", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+            },
+            {
+                "name": "write_file",
+                "title": "Write File",
+                "description": "Write a UTF-8 text file, creating parent directories when needed.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                    "required": ["path", "content"],
+                    "additionalProperties": False,
+                },
+                "outputSchema": path_result_schema,
+                "annotations": {"title": "Write File", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
+            },
+            {
+                "name": "create_directory",
+                "title": "Create Directory",
+                "description": "Create a directory and parents inside the allowed root.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                    "additionalProperties": False,
+                },
+                "outputSchema": path_result_schema,
+                "annotations": {"title": "Create Directory", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+            },
+            {
+                "name": "delete_file",
+                "title": "Delete Or Quarantine",
+                "description": "Delete or quarantine a file or directory. Recursive directory deletion requires confirm_recursive=true unless using quarantine mode.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "dry_run": {"type": "boolean", "default": False},
+                        "mode": {"type": "string", "enum": ["quarantine", "permanent"], "default": "quarantine"},
+                        "confirm_recursive": {"type": "boolean", "description": "Required for permanent recursive directory delete", "default": False},
+                    },
+                    "required": ["path"],
+                    "additionalProperties": False,
+                },
+                "outputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "success": ok_schema,
+                        "dryRun": ok_schema,
+                        "mode": text_schema,
+                        "message": text_schema,
+                        "path": text_schema,
+                        "quarantinePath": text_schema,
+                        "type": text_schema,
+                    },
+                    "required": ["success", "path", "type"],
+                    "additionalProperties": True,
+                },
+                "annotations": {"title": "Delete Or Quarantine", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
+            },
+            {
+                "name": "delete_file_dry_run",
+                "title": "Preview Delete",
+                "description": "Preview deleting or quarantining a path without changing files. Compatibility alias for clients that hide optional parameters.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                    "additionalProperties": False,
+                },
+                "outputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "success": ok_schema,
+                        "dryRun": ok_schema,
+                        "mode": text_schema,
+                        "message": text_schema,
+                        "path": text_schema,
+                        "type": text_schema,
+                    },
+                    "required": ["success", "path", "type"],
+                    "additionalProperties": True,
+                },
+                "annotations": {"title": "Preview Delete", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+            },
+            {
+                "name": "delete_file_permanent",
+                "title": "Delete Permanently",
+                "description": "Permanently delete a file or directory. Recursive directory deletion requires confirm_recursive=true.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "confirm_recursive": {"type": "boolean", "description": "Required for permanent recursive directory delete", "default": False},
+                    },
+                    "required": ["path"],
+                    "additionalProperties": False,
+                },
+                "outputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "success": ok_schema,
+                        "mode": text_schema,
+                        "message": text_schema,
+                        "path": text_schema,
+                        "type": text_schema,
+                    },
+                    "required": ["success", "path", "type"],
+                    "additionalProperties": True,
+                },
+                "annotations": {"title": "Delete Permanently", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
+            },
+        ]
+
     # -------- Codex-style tool impls --------
+    def handle_status(self, verbose: bool = False) -> dict:
+        status = {
+            "success": True,
+            "serverVersion": SERVER_VERSION,
+            "protocolVersion": PROTOCOL_VERSION,
+            "allowedRoot": str(self.allowed_directory),
+            "platform": platform.platform(),
+            "python": sys.version.split()[0],
+            "availableTools": [tool["name"] for tool in self.tool_definitions()],
+            "maxFetchBytes": MAX_FETCH_BYTES,
+            "shell": {
+                "defaultTimeoutSeconds": DEFAULT_TIMEOUT_SEC,
+                "maxTimeoutSeconds": MAX_TIMEOUT_SEC,
+                "blockedCommands": self._blocked_commands(),
+            },
+            "transport": {
+                "legacySse": "/sse/",
+                "streamableHttpPost": "/mcp",
+                "rootPost": "/",
+                "originValidation": True,
+                "authRequired": bool(self.config.get("auth_token")),
+            },
+            "runtime": {
+                "gitAvailable": self._command_available("git"),
+                "pythonAvailable": self._command_available("python") or self._command_available("py"),
+                "ngrokAvailable": self._command_available("ngrok"),
+            },
+        }
+        if verbose:
+            status["toolDefinitions"] = self.tool_definitions()
+            status["config"] = {
+                "allowedOrigins": self.config.get("allowed_origins") or [],
+                "blockedCommands": self._blocked_commands(),
+                "auditLog": str(self.allowed_directory / AUDIT_LOG_NAME),
+                "quarantineDirectory": str(self.allowed_directory / QUARANTINE_DIR_NAME),
+            }
+        return status
+
     def handle_shell(self, args: dict) -> dict:
         """
         Execute a shell command similar to Codex CLI's 'shell' tool:
@@ -332,7 +682,13 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
         else:
             raise ValueError("command must be string or array of strings")
 
+        blocked = self._matched_blocked_command(cmd)
+        if blocked:
+            self._audit("shell_blocked", {"command": cmd, "workdir": str(workdir), "matched": blocked})
+            raise PermissionError(f"Blocked shell command pattern: {blocked}")
+
         timeout = max(1, min(int(args.get("timeout", DEFAULT_TIMEOUT_SEC)), MAX_TIMEOUT_SEC))
+        self._audit("shell", {"command": cmd, "workdir": str(workdir), "timeout": timeout})
         try:
             proc = subprocess.run(
                 run_command,
@@ -358,7 +714,7 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
         err = (proc.stderr or "")[:MAX_STDERR_CHARS]
         return {"ok": proc.returncode == 0, "exitCode": proc.returncode, "timedOut": False, "stdout": out, "stderr": err}
 
-    def handle_apply_patch(self, patch_text: str) -> dict:
+    def handle_apply_patch(self, patch_text: str, dry_run: bool = False) -> dict:
         """
         Apply the common Codex patch format:
           *** Add File: path
@@ -373,13 +729,14 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
         if not lines or not lines[0].strip() == "*** Begin Patch":
             raise ValueError("Patch must start with '*** Begin Patch'")
 
-        changed = {"added": [], "updated": [], "deleted": [], "moved": []}
+        changed = {"success": True, "dryRun": dry_run, "added": [], "updated": [], "deleted": [], "moved": []}
         idx = 1
 
         while idx < len(lines):
             current = lines[idx].rstrip("\r\n")
             if current == "*** End Patch":
-                return {"success": True, **changed}
+                self._audit("apply_patch", changed)
+                return changed
 
             if current.startswith("*** Add File:"):
                 rel_path = current[len("*** Add File:"):].strip()
@@ -393,8 +750,9 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
                 file_path = self.validate_path(rel_path)
                 if file_path.exists():
                     raise FileExistsError(f"File already exists: {rel_path}")
-                file_path.parent.mkdir(parents=True, exist_ok=True)
-                file_path.write_text("".join(body), encoding="utf-8", newline="")
+                if not dry_run:
+                    file_path.parent.mkdir(parents=True, exist_ok=True)
+                    file_path.write_text("".join(body), encoding="utf-8", newline="")
                 changed["added"].append(self._relative_id(file_path))
                 continue
 
@@ -403,7 +761,8 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
                 file_path = self.validate_path(rel_path)
                 if not file_path.exists() or not file_path.is_file():
                     raise FileNotFoundError(f"File not found: {rel_path}")
-                file_path.unlink()
+                if not dry_run:
+                    file_path.unlink()
                 changed["deleted"].append(self._relative_id(file_path))
                 idx += 1
                 continue
@@ -425,17 +784,20 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
                     section.append(lines[idx])
                     idx += 1
 
-                text = source_path.read_text(encoding="utf-8", errors="replace")
+                with source_path.open("r", encoding="utf-8", errors="replace", newline="") as fh:
+                    text = fh.read()
                 if self._looks_like_hunk(section):
                     new_text = self._apply_update_hunks(text, section, rel_path)
                 else:
                     new_text = "".join(section)
 
                 target_path = self.validate_path(move_to) if move_to else source_path
-                target_path.parent.mkdir(parents=True, exist_ok=True)
-                target_path.write_text(new_text, encoding="utf-8", newline="")
+                if not dry_run:
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    target_path.write_text(new_text, encoding="utf-8", newline="")
                 if move_to and target_path != source_path:
-                    source_path.unlink()
+                    if not dry_run:
+                        source_path.unlink()
                     changed["moved"].append({"from": self._relative_id(source_path), "to": self._relative_id(target_path)})
                 else:
                     changed["updated"].append(self._relative_id(target_path))
@@ -500,6 +862,9 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
             position = self._find_subsequence(content, old, cursor)
             if position is None:
                 raise ValueError(f"Patch context not found in {rel_path}")
+            line_ending = self._line_ending_for(content[position:position + len(old)])
+            if line_ending:
+                new = [self._with_line_ending(line, line_ending) for line in new]
             content[position:position + len(old)] = new
             cursor = position + len(new)
 
@@ -511,7 +876,26 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
         for pos in range(start, len(content) - len(needle) + 1):
             if content[pos:pos + len(needle)] == needle:
                 return pos
+            if [self._line_body(line) for line in content[pos:pos + len(needle)]] == [self._line_body(line) for line in needle]:
+                return pos
         return None
+
+    def _line_body(self, line: str) -> str:
+        return line.rstrip("\r\n")
+
+    def _line_ending_for(self, lines: list[str]) -> str:
+        for line in lines:
+            if line.endswith("\r\n"):
+                return "\r\n"
+            if line.endswith("\n"):
+                return "\n"
+            if line.endswith("\r"):
+                return "\r"
+        return ""
+
+    def _with_line_ending(self, line: str, ending: str) -> str:
+        body = self._line_body(line)
+        return body + ending if line.endswith(("\r", "\n")) else body
 
     def _restricted_env(self):
         """Environment stripped down; PATH preserved for common tools."""
@@ -581,27 +965,96 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
         path = self.validate_path(dest)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
-        return {"success": True, "message": f"Wrote {len(content)} bytes to {dest}", "path": dest}
+        result = {"success": True, "message": f"Wrote {len(content)} bytes to {dest}", "path": self._relative_id(path)}
+        self._audit("write_file", result)
+        return result
 
     def handle_create_directory(self, p: str) -> dict:
         if not p:
             raise ValueError("Directory path is required")
         path = self.validate_path(p)
         path.mkdir(parents=True, exist_ok=True)
-        return {"success": True, "message": f"Created directory: {p}", "path": p}
+        result = {"success": True, "message": f"Created directory: {p}", "path": self._relative_id(path)}
+        self._audit("create_directory", result)
+        return result
 
-    def handle_delete_file(self, p: str) -> dict:
+    def handle_delete_file(self, p: str, dry_run: bool = False, mode: str = "quarantine", confirm_recursive: bool = False) -> dict:
         if not p:
             raise ValueError("Path is required")
+        if mode not in {"quarantine", "permanent"}:
+            raise ValueError("delete_file mode must be 'quarantine' or 'permanent'")
         path = self.validate_path(p)
         if not path.exists():
             raise ValueError(f"Path does not exist: {p}")
+        rel = self._relative_id(path)
+        path_type = "directory" if path.is_dir() else "file"
+        if dry_run:
+            return {"success": True, "dryRun": True, "mode": mode, "path": rel, "type": path_type, "message": f"Would delete {path_type}: {rel}"}
         if path.is_dir():
-            import shutil
-            shutil.rmtree(path)
-            return {"success": True, "message": f"Deleted directory: {p}", "path": p, "type": "directory"}
-        path.unlink()
-        return {"success": True, "message": f"Deleted file: {p}", "path": p, "type": "file"}
+            if mode == "permanent" and not confirm_recursive:
+                raise PermissionError("Permanent recursive directory delete requires confirm_recursive=true")
+            if mode == "quarantine":
+                target = self._quarantine_path(path)
+                shutil.move(str(path), str(target))
+                result = {"success": True, "mode": mode, "message": f"Moved directory to quarantine: {rel}", "path": rel, "quarantinePath": self._relative_id(target), "type": "directory"}
+            else:
+                shutil.rmtree(path)
+                result = {"success": True, "mode": mode, "message": f"Deleted directory permanently: {rel}", "path": rel, "type": "directory"}
+            self._audit("delete_file", result)
+            return result
+        if mode == "quarantine":
+            target = self._quarantine_path(path)
+            shutil.move(str(path), str(target))
+            result = {"success": True, "mode": mode, "message": f"Moved file to quarantine: {rel}", "path": rel, "quarantinePath": self._relative_id(target), "type": "file"}
+        else:
+            path.unlink()
+            result = {"success": True, "mode": mode, "message": f"Deleted file permanently: {rel}", "path": rel, "type": "file"}
+        self._audit("delete_file", result)
+        return result
+
+    def _blocked_commands(self) -> list[str]:
+        configured = self.config.get("blocked_commands")
+        if configured is not None:
+            return [item for item in configured if item]
+        env_value = os.environ.get("MCP_BLOCKED_COMMANDS")
+        if env_value:
+            return [item.strip() for item in env_value.split(";") if item.strip()]
+        return list(DEFAULT_BLOCKED_COMMANDS)
+
+    def _matched_blocked_command(self, command) -> str | None:
+        text = " ".join(command) if isinstance(command, list) else str(command)
+        normalized = text.lower()
+        for pattern in self._blocked_commands():
+            if pattern.lower() in normalized:
+                return pattern
+        return None
+
+    def _command_available(self, command: str) -> bool:
+        return shutil.which(command) is not None
+
+    def _quarantine_path(self, source: Path) -> Path:
+        quarantine_root = self.allowed_directory / QUARANTINE_DIR_NAME
+        quarantine_root.mkdir(exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        candidate = quarantine_root / f"{stamp}_{source.name}"
+        counter = 1
+        while candidate.exists():
+            candidate = quarantine_root / f"{stamp}_{counter}_{source.name}"
+            counter += 1
+        return candidate
+
+    def _audit(self, action: str, details: dict):
+        event = {
+            "time": datetime.now(timezone.utc).isoformat(),
+            "action": action,
+            "details": details,
+        }
+        try:
+            audit_path = self.allowed_directory / AUDIT_LOG_NAME
+            with audit_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
 
     # -------- security --------
     def validate_path(self, user_path: str) -> Path:
@@ -622,9 +1075,9 @@ class MCPHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
 
-def create_handler(allowed_directory: Path):
+def create_handler(allowed_directory: Path, config: dict | None = None):
     def handler(*args, **kwargs):
-        return MCPSSEHandler(allowed_directory, *args, **kwargs)
+        return MCPSSEHandler(allowed_directory, config, *args, **kwargs)
     return handler
 
 
@@ -633,6 +1086,9 @@ def main():
     parser.add_argument("directory", help="Directory the server is allowed to access")
     parser.add_argument("--host", default="localhost", help="Host interface to bind (default: localhost)")
     parser.add_argument("--port", type=int, default=8000, help="Port to listen on (default: 8000)")
+    parser.add_argument("--auth-token", default=os.environ.get("MCP_AUTH_TOKEN", ""), help="Optional bearer token required for HTTP requests")
+    parser.add_argument("--allow-origin", action="append", default=[], help="Allowed Origin header. May be repeated. Localhost origins are always allowed.")
+    parser.add_argument("--blocked-command", action="append", default=None, help="Blocked shell command substring. May be repeated. Defaults block common destructive patterns.")
     args = parser.parse_args()
 
     allowed_directory = Path(args.directory).resolve()
@@ -643,8 +1099,14 @@ def main():
     print(f"Starting MCP server restricted to: {allowed_directory}")
     print(f"Server URL: http://{args.host}:{args.port}")
     print(f"SSE URL for ChatGPT: http://{args.host}:{args.port}/sse/")
+    print(f"Streamable HTTP-style POST URL: http://{args.host}:{args.port}/mcp")
 
-    with MCPHTTPServer((args.host, args.port), create_handler(allowed_directory)) as server:
+    config = {
+        "auth_token": args.auth_token,
+        "allowed_origins": args.allow_origin,
+        "blocked_commands": args.blocked_command,
+    }
+    with MCPHTTPServer((args.host, args.port), create_handler(allowed_directory, config)) as server:
         print("Server started. Use Ctrl+C to stop.")
         try:
             server.serve_forever()
