@@ -23,7 +23,7 @@ class FileSystemMCPTests(unittest.TestCase):
             handler = make_handler(Path(tmp))
 
             init = handler.process_mcp_message({"jsonrpc": "2.0", "id": 1, "method": "initialize"})
-            self.assertEqual(init["result"]["serverInfo"]["version"], "1.3.1")
+            self.assertEqual(init["result"]["serverInfo"]["version"], "1.4.1")
 
             listed = handler.process_mcp_message({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
             tools = {tool["name"]: tool for tool in listed["result"]["tools"]}
@@ -50,7 +50,7 @@ class FileSystemMCPTests(unittest.TestCase):
 
             result = response["result"]
             self.assertIn("structuredContent", result)
-            self.assertEqual(result["structuredContent"]["serverVersion"], "1.3.1")
+            self.assertEqual(result["structuredContent"]["serverVersion"], "1.4.1")
             self.assertEqual(json.loads(result["content"][0]["text"])["success"], True)
 
     def test_alias_tools_and_camel_case_args_work(self):
@@ -278,7 +278,7 @@ class FileSystemMCPTests(unittest.TestCase):
             self.assertTrue(result["dryRun"])
             self.assertEqual(target.read_text(encoding="utf-8"), "one\ntwo\n")
 
-            with self.assertRaises(ValueError):
+            with self.assertRaises(ValueError) as ctx:
                 handler.handle_apply_patch("""*** Begin Patch
 *** Update File: sample.txt
 @@
@@ -286,6 +286,7 @@ class FileSystemMCPTests(unittest.TestCase):
 +found
 *** End Patch
 """)
+            self.assertIn("Patch context not found", str(ctx.exception))
 
     def test_apply_patch_move_and_crlf_lf_handling(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -377,6 +378,242 @@ class FileSystemMCPTests(unittest.TestCase):
             deleted = handler.handle_delete_file("folder", mode="permanent", confirm_recursive=True)
             self.assertEqual(deleted["type"], "directory")
             self.assertFalse(directory.exists())
+
+
+class ApplyPatchClassificationAndFuzzyMatchTests(unittest.TestCase):
+    def test_apply_patch_section_with_diff_markers_but_no_hunk_raises(self):
+        """T-1 / AC-1: section with diff markers mixed with prose must fail explicitly,
+        not silently fall through to full-file replacement."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "x.txt"
+            target.write_text("original line\n", encoding="utf-8")
+            handler = make_handler(root)
+
+            with self.assertRaises(ValueError) as ctx:
+                handler.handle_apply_patch("""*** Begin Patch
+*** Update File: x.txt
+This is prose not a hunk
++added line
+-removed line
+*** End Patch
+""")
+            message = str(ctx.exception)
+            self.assertIn("diff markers", message)
+            self.assertIn("unified diff hunk", message)
+            self.assertIn("*** Add File:", message)
+            self.assertEqual(target.read_text(encoding="utf-8"), "original line\n")
+
+    def test_apply_patch_valid_full_replace_writes_file_with_warning(self):
+        """T-2 / AC-2 + AC-5: Update body with NO diff markers anywhere is treated
+        as a deliberate full-file replacement and emits a warning."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "y.txt"
+            target.write_text("old content\n", encoding="utf-8")
+            handler = make_handler(root)
+
+            result = handler.handle_apply_patch("""*** Begin Patch
+*** Update File: y.txt
+totally new content
+no diff markers here
+*** End Patch
+""")
+
+            self.assertTrue(result["success"])
+            self.assertIn("y.txt", result["updated"])
+            self.assertEqual(
+                target.read_text(encoding="utf-8"),
+                "totally new content\nno diff markers here\n",
+            )
+            self.assertEqual(len(result["warnings"]), 1)
+            self.assertIn("no diff markers found", result["warnings"][0])
+            self.assertIn("y.txt", result["warnings"][0])
+
+    def test_apply_patch_warnings_field_present_even_when_empty(self):
+        """AC-5 corollary: 'warnings' key is always present in the response,
+        defaulting to []."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "z.txt"
+            target.write_text("one\ntwo\nthree\n", encoding="utf-8")
+            handler = make_handler(root)
+
+            result = handler.handle_apply_patch("""*** Begin Patch
+*** Update File: z.txt
+@@
+ one
+-two
++TWO
+ three
+*** End Patch
+""")
+            self.assertIn("warnings", result)
+            self.assertEqual(result["warnings"], [])
+
+    def test_apply_patch_empty_update_section_blanks_file_with_warning(self):
+        """Empty Update body preserves prior behaviour (file blanked) but is now
+        surfaced via a warning rather than being silent."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "e.txt"
+            target.write_text("content to blank\n", encoding="utf-8")
+            handler = make_handler(root)
+
+            result = handler.handle_apply_patch("""*** Begin Patch
+*** Update File: e.txt
+*** End Patch
+""")
+            self.assertTrue(result["success"])
+            self.assertEqual(target.read_text(encoding="utf-8"), "")
+            self.assertEqual(len(result["warnings"]), 1)
+            self.assertIn("no diff markers found", result["warnings"][0])
+
+    def test_apply_patch_context_with_trailing_whitespace_matches(self):
+        """T-3 / AC-3: file has trailing whitespace on a context line that the
+        patch context omits — _find_subsequence Pass 3 should match via rstrip."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "ws.txt"
+            target.write_text("alpha\nbeta  \ngamma\n", encoding="utf-8")
+            handler = make_handler(root)
+
+            result = handler.handle_apply_patch("""*** Begin Patch
+*** Update File: ws.txt
+@@
+ alpha
+ beta
+-gamma
++GAMMA
+*** End Patch
+""")
+            self.assertTrue(result["success"])
+            self.assertIn("ws.txt", result["updated"])
+            final = target.read_text(encoding="utf-8")
+            self.assertIn("GAMMA", final)
+            self.assertNotIn("gamma", final)
+
+    def test_apply_patch_genuine_context_miss_still_raises(self):
+        """T-4 / AC-4: when no fuzzy pass can match, the error message format is
+        stable and includes the path."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "miss.txt"
+            target.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+            handler = make_handler(root)
+
+            with self.assertRaises(ValueError) as ctx:
+                handler.handle_apply_patch("""*** Begin Patch
+*** Update File: miss.txt
+@@
+ totally
+-different
++content
+*** End Patch
+""")
+            self.assertIn("Patch context not found", str(ctx.exception))
+            self.assertIn("miss.txt", str(ctx.exception))
+
+    def test_apply_patch_dry_run_inherits_classify_error(self):
+        """T-5 / AC-6: classification ValueError surfaces under dry_run as well —
+        no silent replacement on the dry-run path."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "d.txt"
+            target.write_text("original\n", encoding="utf-8")
+            handler = make_handler(root)
+
+            with self.assertRaises(ValueError) as ctx:
+                handler.handle_apply_patch(
+                    """*** Begin Patch
+*** Update File: d.txt
+some prose
++added
+*** End Patch
+""",
+                    dry_run=True,
+                )
+            self.assertIn("diff markers", str(ctx.exception))
+            self.assertEqual(target.read_text(encoding="utf-8"), "original\n")
+
+
+class ShellModeAndBlockedCommandTests(unittest.TestCase):
+    def test_shell_disable_removes_tool_from_tool_definitions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            handler = make_handler(Path(tmp))
+            handler.config = {"shell_mode": "disable"}
+            names = [t["name"] for t in handler.tool_definitions()]
+            self.assertNotIn("shell", names)
+
+    def test_shell_disable_leaves_other_tools_present(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            allow_handler = make_handler(Path(tmp))
+            disable_handler = make_handler(Path(tmp))
+            disable_handler.config = {"shell_mode": "disable"}
+
+            allow_names = {t["name"] for t in allow_handler.tool_definitions()}
+            disable_names = {t["name"] for t in disable_handler.tool_definitions()}
+
+            self.assertEqual(allow_names - disable_names, {"shell"})
+            self.assertGreater(len(disable_names), 1)
+
+    def test_shell_disable_tools_call_returns_jsonrpc_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            handler = make_handler(Path(tmp))
+            handler.config = {"shell_mode": "disable"}
+            response = handler.process_mcp_message({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "tools/call",
+                "params": {"name": "shell", "arguments": {"command": "echo hi", "workdir": tmp}},
+            })
+            self.assertEqual(response["id"], 42)
+            self.assertIn("error", response)
+            self.assertEqual(response["error"]["code"], -32601)
+            self.assertEqual(response["error"]["message"], "shell tool is disabled")
+
+    def test_shell_mode_default_is_allow_and_includes_shell(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            handler = make_handler(Path(tmp))
+            self.assertEqual(handler._shell_mode(), "allow")
+            names = [t["name"] for t in handler.tool_definitions()]
+            self.assertIn("shell", names)
+
+    def test_shell_mode_invalid_value_falls_back_to_allow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            handler = make_handler(Path(tmp))
+            handler.config = {"shell_mode": "totally-bogus"}
+            self.assertEqual(handler._shell_mode(), "allow")
+            names = [t["name"] for t in handler.tool_definitions()]
+            self.assertIn("shell", names)
+
+    def test_blocked_command_double_space_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            handler = make_handler(Path(tmp))
+            self.assertEqual(handler._matched_blocked_command("rm  -rf /"), "rm -rf")
+
+    def test_blocked_command_uppercase_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            handler = make_handler(Path(tmp))
+            self.assertEqual(handler._matched_blocked_command("RM -RF /"), "rm -rf")
+
+    def test_blocked_command_powershell_remove_item_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            handler = make_handler(Path(tmp))
+            self.assertIsNotNone(handler._matched_blocked_command("Remove-Item -Recurse C:\\foo"))
+            self.assertIsNotNone(handler._matched_blocked_command("remove-item   -r  foo"))
+
+    def test_blocked_command_legitimate_command_allowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            handler = make_handler(Path(tmp))
+            self.assertIsNone(handler._matched_blocked_command("python --version"))
+            self.assertIsNone(handler._matched_blocked_command(["python", "--version"]))
+
+    def test_blocked_command_existing_rm_pattern_still_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            handler = make_handler(Path(tmp))
+            with self.assertRaises(PermissionError):
+                handler.handle_shell({"command": "rm -rf important", "workdir": tmp, "timeout": 1})
 
 
 if __name__ == "__main__":

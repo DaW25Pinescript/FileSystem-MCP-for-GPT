@@ -51,6 +51,7 @@ Optional flags:
 --auth-token TOKEN          Optional bearer token required for requests
 --allow-origin ORIGIN       Allowed Origin header; repeatable
 --blocked-command TEXT      Blocked shell command substring; repeatable
+--shell-mode MODE           Shell tool exposure: allow | disable (default: allow)
 ```
 
 The legacy `/sse/` endpoint remains available. A modern-style POST endpoint is also available at `/mcp`.
@@ -69,7 +70,7 @@ Add the HTTPS forwarding URL in ChatGPT's custom MCP server settings, usually wi
 https://example.ngrok-free.app/sse/
 ```
 
-Security note: this server exposes local file editing and shell execution. File tools enforce the allowed root, and `shell` requires a working directory inside that root, but your operating system shell is not a complete sandbox. Only run it for directories you are comfortable exposing to the connected assistant, and stop the tunnel when you are done.
+Security note: this server exposes local file editing and shell execution. File tools enforce the allowed root, and `shell` requires a working directory inside that root, but **the operating system shell is not a sandbox**. A shell command can still read or write paths outside the allowed root regardless of the `workdir` argument. Only run it for directories you are comfortable exposing to the connected assistant, and stop the tunnel when you are done. For ngrok-exposed or otherwise untrusted deployments, set `--shell-mode disable` (see [Shell mode](#shell-mode)).
 
 For ngrok or any non-local exposure, prefer an auth token:
 
@@ -108,7 +109,20 @@ String commands run through the platform shell. This is intentional for Windows 
 
 Use an argv array when you want no shell interpolation.
 
-Shell invocations are appended to `.mcp_audit.log` under the allowed root. By default, obvious destructive command substrings such as `rm -rf`, `rmdir /s`, `del /s`, and `format ` are blocked. Override the list with one or more `--blocked-command` flags or `MCP_BLOCKED_COMMANDS` separated by semicolons.
+Shell invocations are appended to `.mcp_audit.log` under the allowed root. By default, obvious destructive command substrings such as `rm -rf`, `rmdir /s`, `del /s`, `format `, `Remove-Item -Recurse`, `Remove-Item -r`, and the `ri -Recurse` PowerShell alias are blocked. The match is case-insensitive and tolerant of internal whitespace (e.g. `rm  -rf` and `RM -RF` are both blocked). Override the list with one or more `--blocked-command` flags or `MCP_BLOCKED_COMMANDS` separated by semicolons.
+
+#### Shell mode
+
+The `--shell-mode` flag (also settable via `MCP_SHELL_MODE`) controls how the `shell` tool is exposed:
+
+| Mode | Behaviour | When to use |
+|------|-----------|-------------|
+| `allow` *(default)* | Shell runs normally. `workdir` is validated against the allowed root and the blocked-command list is enforced. **The command itself can still touch paths outside the allowed root** — there is no OS-level containment. | Trusted local use only. |
+| `disable` | The `shell` tool is removed from the published tool list and any `tools/call` for `shell` returns a JSON-RPC `-32601` error. | **Recommended for ngrok-exposed or otherwise untrusted deployments** — the only mode that actually prevents shell execution. |
+
+Unknown or unsupported values fall back to `allow`. All other tools (`apply_patch`, `search`, `fetch`, `write_file`, `delete_file`, `status`, etc.) are unaffected by this setting.
+
+A `restrict` mode (best-effort stdout/stderr path scanning) is planned for a later hardening phase. Until that ships it is **not** a recognised value — passing `--shell-mode restrict` on the CLI is rejected by argparse, and setting `MCP_SHELL_MODE=restrict` falls back to `allow`.
 
 ### `apply_patch`
 

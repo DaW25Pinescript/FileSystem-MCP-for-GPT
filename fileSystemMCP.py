@@ -26,7 +26,7 @@ MAX_TIMEOUT_SEC = 300
 MAX_STDOUT_CHARS = 200_000
 MAX_STDERR_CHARS = 200_000
 MAX_FETCH_BYTES = 5 * 1024 * 1024
-SERVER_VERSION = "1.3.1"
+SERVER_VERSION = "1.4.1"
 
 TEXT_SUFFIXES = {
     ".bat", ".cmd", ".css", ".csv", ".env", ".gitignore", ".html", ".ini",
@@ -37,7 +37,19 @@ SKIP_SEARCH_DIRS = {
     ".git", ".hg", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".venv",
     "__pycache__", "build", "dist", "node_modules", "venv",
 }
-DEFAULT_BLOCKED_COMMANDS = ("rm -rf", "rmdir /s", "del /s", "format ")
+DEFAULT_BLOCKED_COMMANDS = (
+    "rm -rf",
+    "rmdir /s",
+    "del /s",
+    "format ",
+    "remove-item -recurse",
+    "remove-item -r",
+    "ri -recurse",
+)
+# "restrict" is intentionally NOT in the valid set yet — planned for a later phase
+# (stdout/stderr path scanning + redaction). Accepting it here without the underlying
+# behaviour would advertise containment that does not exist.
+VALID_SHELL_MODES = ("allow", "disable")
 AUDIT_LOG_NAME = ".mcp_audit.log"
 QUARANTINE_DIR_NAME = ".mcp_trash"
 
@@ -222,6 +234,8 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
         elif method == "tools/call":
             tool_name = params.get("name")
             tool_args = params.get("arguments", {}) or {}
+            if tool_name == "shell" and self._shell_mode() == "disable":
+                return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": "shell tool is disabled"}}
             try:
                 if tool_name == "status":
                     result = self.handle_status(bool(tool_args.get("verbose", False)))
@@ -301,7 +315,7 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
             "required": ["success", "path"],
             "additionalProperties": True,
         }
-        return [
+        definitions = [
             {
                 "name": "status",
                 "title": "Server Status",
@@ -609,6 +623,9 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
                 "annotations": {"title": "Delete Permanently", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
             },
         ]
+        if self._shell_mode() == "disable":
+            definitions = [t for t in definitions if t["name"] != "shell"]
+        return definitions
 
     # -------- Codex-style tool impls --------
     def handle_status(self, verbose: bool = False) -> dict:
@@ -729,7 +746,7 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
         if not lines or not lines[0].strip() == "*** Begin Patch":
             raise ValueError("Patch must start with '*** Begin Patch'")
 
-        changed = {"success": True, "dryRun": dry_run, "added": [], "updated": [], "deleted": [], "moved": []}
+        changed = {"success": True, "dryRun": dry_run, "added": [], "updated": [], "deleted": [], "moved": [], "warnings": []}
         idx = 1
 
         while idx < len(lines):
@@ -786,10 +803,14 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
 
                 with source_path.open("r", encoding="utf-8", errors="replace", newline="") as fh:
                     text = fh.read()
-                if self._looks_like_hunk(section):
+                classification = self._classify_section(section)
+                if classification == "hunk":
                     new_text = self._apply_update_hunks(text, section, rel_path)
                 else:
                     new_text = "".join(section)
+                    changed["warnings"].append(
+                        f"{rel_path}: no diff markers found in Update section — applied as full-file replacement"
+                    )
 
                 target_path = self.validate_path(move_to) if move_to else source_path
                 if not dry_run:
@@ -828,6 +849,29 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
                 continue
             return False
         return saw_marker and saw_edit
+
+    def _classify_section(self, section: list[str]) -> str:
+        """Classify an Update section as 'hunk' or 'full_replace'.
+
+        Raises ValueError when the section contains diff markers (+/-/@@) but is
+        not a valid unified diff hunk — preventing silent full-file overwrites
+        from malformed patches.
+        """
+        if not section:
+            return "full_replace"
+        if self._looks_like_hunk(section):
+            return "hunk"
+        has_diff_markers = any(
+            (line[:1] in ("+", "-") or line.startswith("@@"))
+            for line in section if line.strip()
+        )
+        if has_diff_markers:
+            raise ValueError(
+                "Section contains diff markers (+/-/@@) but is not a valid unified "
+                "diff hunk. Use '*** Add File:' for new files or supply a valid "
+                "unified diff hunk with @@ headers."
+            )
+        return "full_replace"
 
     def _apply_update_hunks(self, original_text: str, section: list[str], rel_path: str) -> str:
         content = original_text.splitlines(keepends=True)
@@ -874,9 +918,14 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
         if not needle:
             return start
         for pos in range(start, len(content) - len(needle) + 1):
-            if content[pos:pos + len(needle)] == needle:
+            window = content[pos:pos + len(needle)]
+            if window == needle:
                 return pos
-            if [self._line_body(line) for line in content[pos:pos + len(needle)]] == [self._line_body(line) for line in needle]:
+            if [self._line_body(line) for line in window] == [self._line_body(line) for line in needle]:
+                return pos
+            # Pass 3: trailing-whitespace tolerance (spaces/tabs/newlines stripped on both sides).
+            # Leading whitespace remains significant so indentation differences still fail to match.
+            if [line.rstrip() for line in window] == [line.rstrip() for line in needle]:
                 return pos
         return None
 
@@ -1021,11 +1070,25 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
             return [item.strip() for item in env_value.split(";") if item.strip()]
         return list(DEFAULT_BLOCKED_COMMANDS)
 
-    def _matched_blocked_command(self, command) -> str | None:
+    def _shell_mode(self) -> str:
+        mode = self.config.get("shell_mode")
+        if mode is None:
+            env_value = os.environ.get("MCP_SHELL_MODE")
+            mode = env_value if env_value else "allow"
+        mode = str(mode).strip().lower()
+        if mode not in VALID_SHELL_MODES:
+            return "allow"
+        return mode
+
+    def _normalise_command_text(self, command) -> str:
+        import re
         text = " ".join(command) if isinstance(command, list) else str(command)
-        normalized = text.lower()
+        return re.sub(r"\s+", " ", text).strip().lower()
+
+    def _matched_blocked_command(self, command) -> str | None:
+        normalized = self._normalise_command_text(command)
         for pattern in self._blocked_commands():
-            if pattern.lower() in normalized:
+            if self._normalise_command_text(pattern) in normalized:
                 return pattern
         return None
 
@@ -1089,6 +1152,12 @@ def main():
     parser.add_argument("--auth-token", default=os.environ.get("MCP_AUTH_TOKEN", ""), help="Optional bearer token required for HTTP requests")
     parser.add_argument("--allow-origin", action="append", default=[], help="Allowed Origin header. May be repeated. Localhost origins are always allowed.")
     parser.add_argument("--blocked-command", action="append", default=None, help="Blocked shell command substring. May be repeated. Defaults block common destructive patterns.")
+    parser.add_argument(
+        "--shell-mode",
+        choices=list(VALID_SHELL_MODES),
+        default=os.environ.get("MCP_SHELL_MODE", "allow"),
+        help="Shell tool exposure: 'allow' (default, current behaviour) or 'disable' (removes the shell tool entirely; recommended for ngrok-exposed deployments).",
+    )
     args = parser.parse_args()
 
     allowed_directory = Path(args.directory).resolve()
@@ -1105,6 +1174,7 @@ def main():
         "auth_token": args.auth_token,
         "allowed_origins": args.allow_origin,
         "blocked_commands": args.blocked_command,
+        "shell_mode": args.shell_mode,
     }
     with MCPHTTPServer((args.host, args.port), create_handler(allowed_directory, config)) as server:
         print("Server started. Use Ctrl+C to stop.")

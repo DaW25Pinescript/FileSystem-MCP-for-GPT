@@ -1,8 +1,18 @@
 # TODO
 
+## Resolved in v1.4.1 (Phase 2 — Patch Correctness)
+
+- **I-3** Silent full-file overwrite — Update sections containing diff markers (`+`/`-`/`@@`) that are not valid unified-diff hunks now raise an explicit `ValueError` instead of silently overwriting the file. Legitimate full-file replacements (no diff markers anywhere) still apply, now with a `warnings` entry. The response always includes a `warnings: []` field. See `HARDENING_SPEC.md` Phase 2.
+- **I-4** `_find_subsequence` whitespace mismatch — added a third fuzzy pass that strips trailing whitespace from both content and needle. Patch contexts that differ from the file only by trailing spaces/tabs now match. Leading whitespace remains significant. Existing CR/LF tolerance unchanged.
+
+## Resolved in v1.4.0 (Phase 1 — Security Hardening)
+
+- **I-1** Shell sandbox escape — `--shell-mode disable` now removes the `shell` tool entirely and is the recommended setting for ngrok-exposed deployments. (`restrict` was descoped from Phase 1 after review — see `HARDENING_SPEC.md` §4.1 and §8 "Reviewer-driven descope".)
+- **I-2** Blocked-command bypass — `_matched_blocked_command` now normalises whitespace and case before matching, and `DEFAULT_BLOCKED_COMMANDS` covers `Remove-Item -Recurse` / `Remove-Item -r` / `ri -Recurse`. Backwards compatible: all prior entries unchanged.
+
 ## Next Refinement Pass: Config and Launcher Usability
 
-Current stable baseline: server version `1.3.1`.
+Current stable baseline: server version `1.4.1`.
 
 The MCP v2 connector now exposes the full tool surface after deleting and recreating the ChatGPT connector registration. Treat future schema/tool-name changes as likely requiring a fresh connector registration, not just `refetch_tools=true`.
 
