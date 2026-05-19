@@ -26,7 +26,7 @@ MAX_TIMEOUT_SEC = 300
 MAX_STDOUT_CHARS = 200_000
 MAX_STDERR_CHARS = 200_000
 MAX_FETCH_BYTES = 5 * 1024 * 1024
-SERVER_VERSION = "1.5.0"
+SERVER_VERSION = "1.6.0"
 
 TEXT_SUFFIXES = {
     ".bat", ".cmd", ".css", ".csv", ".env", ".gitignore", ".html", ".ini",
@@ -252,7 +252,13 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
                 elif tool_name == "fetch":
                     result = self.handle_fetch(tool_args.get("id", ""))
                 elif tool_name == "write_file":
-                    result = self.handle_write_file(tool_args.get("path", ""), tool_args.get("content", ""))
+                    result = self.handle_write_file(
+                        tool_args.get("path", ""),
+                        tool_args.get("content", ""),
+                        overwrite=bool(tool_args.get("overwrite", True)),
+                    )
+                elif tool_name == "str_replace":
+                    result = self.handle_str_replace(tool_args)
                 elif tool_name == "create_directory":
                     result = self.handle_create_directory(tool_args.get("path", ""))
                 elif tool_name == "delete_file":
@@ -516,15 +522,36 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
             {
                 "name": "write_file",
                 "title": "Write File",
-                "description": "Write a UTF-8 text file, creating parent directories when needed.",
+                "description": "Write a UTF-8 text file, creating parent directories when needed. Pass overwrite=false to fail when the target already exists.",
                 "inputSchema": {
                     "type": "object",
-                    "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"},
+                        "overwrite": {"type": "boolean", "description": "When false, fails if the target file already exists. Default true preserves prior behaviour.", "default": True},
+                    },
                     "required": ["path", "content"],
                     "additionalProperties": False,
                 },
                 "outputSchema": path_result_schema,
                 "annotations": {"title": "Write File", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
+            },
+            {
+                "name": "str_replace",
+                "title": "Surgical String Replace",
+                "description": "Replace a single, unique occurrence of old_str with new_str inside an existing UTF-8 text file. Fails if old_str is not present or appears more than once.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Path to an existing file inside the allowed root"},
+                        "old_str": {"type": "string", "description": "Exact substring to replace; must occur exactly once"},
+                        "new_str": {"type": "string", "description": "Replacement text"},
+                    },
+                    "required": ["path", "old_str", "new_str"],
+                    "additionalProperties": False,
+                },
+                "outputSchema": path_result_schema,
+                "annotations": {"title": "Surgical String Replace", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
             },
             {
                 "name": "create_directory",
@@ -1001,21 +1028,74 @@ class MCPSSEHandler(BaseHTTPRequestHandler):
             raise ValueError(f"File too large (limit {MAX_FETCH_BYTES // (1024 * 1024)}MB)")
         try:
             text = path.read_text(encoding="utf-8")
+            encoding = "utf-8"
         except UnicodeDecodeError:
             if path.suffix.lower() in TEXT_SUFFIXES:
                 text = path.read_text(encoding="utf-8", errors="replace")
+                encoding = "utf-8-replace-fallback"
             else:
                 text = f"[Binary file: {path.suffix or 'unknown'}]"
-        return {"id": file_id, "title": path.name, "text": text, "url": f"file://{path.resolve()}", "metadata": {"type": "file", "size": path.stat().st_size}}
+                encoding = "binary-placeholder"
+        return {
+            "id": file_id,
+            "title": path.name,
+            "text": text,
+            "url": f"file://{path.resolve()}",
+            "metadata": {"type": "file", "size": path.stat().st_size, "encoding": encoding},
+        }
 
-    def handle_write_file(self, dest: str, content: str) -> dict:
+    def handle_write_file(self, dest: str, content: str, overwrite: bool = True) -> dict:
         if not dest:
             raise ValueError("File path is required")
         path = self.validate_path(dest)
+        if not overwrite and path.exists():
+            raise FileExistsError(f"File exists and overwrite=false: {dest}")
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         result = {"success": True, "message": f"Wrote {len(content)} bytes to {dest}", "path": self._relative_id(path)}
         self._audit("write_file", result)
+        return result
+
+    def handle_str_replace(self, args: dict) -> dict:
+        """Surgical single-location string replacement.
+
+        Reads strictly as UTF-8 (no replace fallback — editing decoded-with-
+        replacement bytes would corrupt the file). Counts occurrences of
+        old_str; raises ValueError if 0 or >1, replaces and writes back on
+        exactly 1. Composes with validate_path for the allowed-root boundary
+        and does its own write so the audit event is attributed to str_replace
+        rather than write_file.
+        """
+        path_arg = args.get("path", "")
+        old_str = args.get("old_str", "")
+        new_str = args.get("new_str", "")
+        if not path_arg:
+            raise ValueError("str_replace requires 'path'")
+        if not isinstance(old_str, str) or not old_str:
+            raise ValueError("str_replace requires non-empty 'old_str'")
+        if not isinstance(new_str, str):
+            raise ValueError("str_replace requires string 'new_str'")
+
+        path = self.validate_path(path_arg)
+        if not path.exists() or not path.is_file():
+            raise FileNotFoundError(f"File not found: {path_arg}")
+
+        content = path.read_text(encoding="utf-8")
+        rel_id = self._relative_id(path)
+        count = content.count(old_str)
+        if count == 0:
+            raise ValueError(f"old_str not found in {rel_id}")
+        if count > 1:
+            raise ValueError(f"old_str matches {count} locations in {rel_id} — must be unique")
+
+        new_content = content.replace(old_str, new_str, 1)
+        path.write_text(new_content, encoding="utf-8")
+        result = {
+            "success": True,
+            "path": rel_id,
+            "message": f"Replaced 1 occurrence in {rel_id}",
+        }
+        self._audit("str_replace", result)
         return result
 
     def handle_create_directory(self, p: str) -> dict:

@@ -31,7 +31,7 @@ class FileSystemMCPTests(unittest.TestCase):
             handler = make_handler(Path(tmp))
 
             init = handler.process_mcp_message({"jsonrpc": "2.0", "id": 1, "method": "initialize"})
-            self.assertEqual(init["result"]["serverInfo"]["version"], "1.5.0")
+            self.assertEqual(init["result"]["serverInfo"]["version"], "1.6.0")
 
             listed = handler.process_mcp_message({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
             tools = {tool["name"]: tool for tool in listed["result"]["tools"]}
@@ -58,7 +58,7 @@ class FileSystemMCPTests(unittest.TestCase):
 
             result = response["result"]
             self.assertIn("structuredContent", result)
-            self.assertEqual(result["structuredContent"]["serverVersion"], "1.5.0")
+            self.assertEqual(result["structuredContent"]["serverVersion"], "1.6.0")
             self.assertEqual(json.loads(result["content"][0]["text"])["success"], True)
 
     def test_alias_tools_and_camel_case_args_work(self):
@@ -329,6 +329,7 @@ class FileSystemMCPTests(unittest.TestCase):
             result = handler.handle_fetch("notes.md")
 
             self.assertEqual(result["metadata"]["type"], "file")
+            self.assertEqual(result["metadata"]["encoding"], "utf-8-replace-fallback")
             self.assertIn("# Notes", result["text"])
             self.assertNotIn("[Binary file:", result["text"])
 
@@ -346,6 +347,7 @@ class FileSystemMCPTests(unittest.TestCase):
 
             result = handler.handle_fetch("data.bin")
             self.assertEqual(result["text"], "[Binary file: .bin]")
+            self.assertEqual(result["metadata"]["encoding"], "binary-placeholder")
 
     def test_search_honors_limit_and_skips_git_noise(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -386,6 +388,200 @@ class FileSystemMCPTests(unittest.TestCase):
             deleted = handler.handle_delete_file("folder", mode="permanent", confirm_recursive=True)
             self.assertEqual(deleted["type"], "directory")
             self.assertFalse(directory.exists())
+
+
+class StrReplaceAndWriteOverwriteTests(unittest.TestCase):
+    def test_str_replace_happy_path_replaces_unique_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "code.py"
+            target.write_text("a = 1\nb = TARGET\nc = 3\n", encoding="utf-8")
+            handler = make_handler(root)
+
+            result = handler.handle_str_replace({
+                "path": "code.py",
+                "old_str": "TARGET",
+                "new_str": "42",
+            })
+            self.assertTrue(result["success"])
+            self.assertEqual(result["path"], "code.py")
+            self.assertEqual(target.read_text(encoding="utf-8"), "a = 1\nb = 42\nc = 3\n")
+
+    def test_str_replace_not_found_returns_error_with_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "code.py"
+            target.write_text("nothing here\n", encoding="utf-8")
+            handler = make_handler(root)
+
+            with self.assertRaises(ValueError) as ctx:
+                handler.handle_str_replace({
+                    "path": "code.py",
+                    "old_str": "MISSING",
+                    "new_str": "x",
+                })
+            self.assertIn("old_str not found in", str(ctx.exception))
+            self.assertIn("code.py", str(ctx.exception))
+            # File unchanged on failure.
+            self.assertEqual(target.read_text(encoding="utf-8"), "nothing here\n")
+
+    def test_str_replace_ambiguous_returns_count_in_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "code.py"
+            target.write_text("X\nY\nX\nZ\nX\n", encoding="utf-8")
+            handler = make_handler(root)
+
+            with self.assertRaises(ValueError) as ctx:
+                handler.handle_str_replace({
+                    "path": "code.py",
+                    "old_str": "X",
+                    "new_str": "Q",
+                })
+            message = str(ctx.exception)
+            self.assertIn("old_str matches", message)
+            self.assertIn("must be unique", message)
+            self.assertIn("code.py", message)
+            self.assertIn("3", message)  # the count
+            # File unchanged on failure.
+            self.assertEqual(target.read_text(encoding="utf-8"), "X\nY\nX\nZ\nX\n")
+
+    def test_str_replace_path_outside_allowed_root_raises_permission_error(self):
+        """Composition watchpoint: str_replace uses validate_path, so the
+        allowed-root boundary is enforced via the same primitive as every
+        other path-taking tool. No parallel security path."""
+        with tempfile.TemporaryDirectory() as tmp_root, tempfile.TemporaryDirectory() as tmp_outside:
+            outside_file = Path(tmp_outside) / "secret.txt"
+            outside_file.write_text("secret", encoding="utf-8")
+            handler = make_handler(Path(tmp_root))
+
+            with self.assertRaises(PermissionError):
+                handler.handle_str_replace({
+                    "path": str(outside_file),
+                    "old_str": "secret",
+                    "new_str": "leaked",
+                })
+            self.assertEqual(outside_file.read_text(encoding="utf-8"), "secret")
+
+    def test_str_replace_missing_file_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            handler = make_handler(Path(tmp))
+            with self.assertRaises(FileNotFoundError):
+                handler.handle_str_replace({
+                    "path": "does-not-exist.txt",
+                    "old_str": "x",
+                    "new_str": "y",
+                })
+
+    def test_str_replace_rejects_empty_old_str(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "x.txt"
+            target.write_text("content\n", encoding="utf-8")
+            handler = make_handler(root)
+            with self.assertRaises(ValueError):
+                handler.handle_str_replace({"path": "x.txt", "old_str": "", "new_str": "y"})
+
+    def test_write_file_overwrite_false_on_existing_file_errors_and_preserves(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "existing.txt"
+            target.write_text("original\n", encoding="utf-8")
+            handler = make_handler(root)
+
+            with self.assertRaises(FileExistsError):
+                handler.handle_write_file("existing.txt", "new content\n", overwrite=False)
+            self.assertEqual(target.read_text(encoding="utf-8"), "original\n")
+
+    def test_write_file_overwrite_false_on_new_file_succeeds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            handler = make_handler(root)
+
+            result = handler.handle_write_file("fresh.txt", "hello\n", overwrite=False)
+            self.assertTrue(result["success"])
+            self.assertEqual((root / "fresh.txt").read_text(encoding="utf-8"), "hello\n")
+
+    def test_write_file_default_overwrite_replaces_content(self):
+        """AC-5: default behaviour matches v1.5.1 — no overwrite kwarg passed,
+        existing file is replaced as before."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "x.txt"
+            target.write_text("first\n", encoding="utf-8")
+            handler = make_handler(root)
+
+            result = handler.handle_write_file("x.txt", "second\n")
+            self.assertTrue(result["success"])
+            self.assertEqual(target.read_text(encoding="utf-8"), "second\n")
+
+
+class FetchEncodingMetadataTests(unittest.TestCase):
+    def test_fetch_strict_decode_sets_encoding_utf_8(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "ok.txt"
+            target.write_text("plain ascii\n", encoding="utf-8")
+            handler = make_handler(root)
+
+            result = handler.handle_fetch("ok.txt")
+            self.assertEqual(result["metadata"]["encoding"], "utf-8")
+
+    def test_fetch_replace_fallback_sets_encoding_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "broken.md"
+            target.write_bytes(b"# Heading\n\xff\xfe garbage \n")
+            handler = make_handler(root)
+
+            result = handler.handle_fetch("broken.md")
+            self.assertEqual(result["metadata"]["encoding"], "utf-8-replace-fallback")
+
+    def test_fetch_binary_placeholder_sets_encoding_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "blob.bin"
+            target.write_bytes(b"\x00\x01\xff\xfe")
+            handler = make_handler(root)
+
+            result = handler.handle_fetch("blob.bin")
+            self.assertEqual(result["metadata"]["encoding"], "binary-placeholder")
+            self.assertIn("[Binary file:", result["text"])
+
+
+class StrReplaceToolDefinitionAndDispatchTests(unittest.TestCase):
+    def test_str_replace_present_in_tool_definitions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            handler = make_handler(Path(tmp))
+            names = [t["name"] for t in handler.tool_definitions()]
+            self.assertIn("str_replace", names)
+
+    def test_write_file_schema_advertises_overwrite_property(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            handler = make_handler(Path(tmp))
+            wf = next(t for t in handler.tool_definitions() if t["name"] == "write_file")
+            self.assertIn("overwrite", wf["inputSchema"]["properties"])
+            self.assertEqual(wf["inputSchema"]["properties"]["overwrite"]["type"], "boolean")
+            self.assertEqual(wf["inputSchema"]["properties"]["overwrite"]["default"], True)
+
+    def test_tools_call_routes_str_replace_through_dispatcher(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "f.py"
+            target.write_text("alpha = OLD\n", encoding="utf-8")
+            handler = make_handler(root)
+
+            response = handler.process_mcp_message({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {"name": "str_replace", "arguments": {
+                    "path": "f.py", "old_str": "OLD", "new_str": "NEW",
+                }},
+            })
+            self.assertEqual(response["id"], 7)
+            self.assertTrue(response["result"]["structuredContent"]["success"])
+            self.assertEqual(target.read_text(encoding="utf-8"), "alpha = NEW\n")
 
 
 class ConfigLoaderAndMergeTests(unittest.TestCase):

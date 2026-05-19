@@ -1,10 +1,10 @@
 # FileSystem-MCP-for-GPT — Hardening Spec
 
 ## Header Block
-- **Status:** Phases 1 ✅ + 2 ✅ + 3 ✅ complete — Phase 4 spec drafted, implementation pending
+- **Status:** All four hardening phases complete ✅
 - **Date:** 2026-05-19
 - **Repo:** `D:\GitHub\FileSystem-MCP-for-GPT`
-- **Baseline version:** `1.3.1` → `1.4.0` (Phase 1) → `1.4.1` (Phase 2) → current `1.5.0` (Phase 3)
+- **Baseline version:** `1.3.1` → `1.4.0` (Phase 1) → `1.4.1` (Phase 2) → `1.5.0` (Phase 3) → current `1.6.0` (Phase 4)
 - **Review level:** Full — security changes, correctness fixes, and new config surface all require careful review before commit
 - **Source:** Combined from independent review findings + existing `TODO.md`
 
@@ -49,7 +49,7 @@ All items from both the independent review and `TODO.md`, merged and ranked.
 | 1 | Security Hardening | Shell sandbox escape + blocked command bypass | I-1, I-2 | ✅ Complete (v1.4.0) |
 | 2 | Patch Correctness | Hunk detection silent failure + whitespace mismatch | I-3, I-4 | ✅ Complete (v1.4.1) |
 | 3 | Config & Launcher | `mcp_config.json` + auth token (launcher work descoped) | T-1, T-3 | ✅ Complete (v1.5.0) |
-| 4 | Quality & Tools | `str_replace`, overwrite guard, binary metadata, SSE, tests | I-5, I-6, I-7, I-8, T-4 | ⏳ Spec drafted |
+| 4 | Quality & Tools | `str_replace`, overwrite guard, binary metadata, tests | I-5, I-6, I-7, T-4 (I-8 descoped) | ✅ Complete (v1.6.0) |
 
 ---
 
@@ -518,16 +518,79 @@ Moves TO → `str_replace` tool available, overwrite guard in place, binary file
 
 | # | Gate | Acceptance Condition | Status |
 |---|------|---------------------|--------|
-| AC-1 | `str_replace` happy path | Unique `old_str` replaced correctly | ⏳ Pending |
-| AC-2 | `str_replace` not found | `old_str` absent → `{"success": false, "error": "old_str not found in [file]"}` | ⏳ Pending |
-| AC-3 | `str_replace` ambiguous | `old_str` found N>1 times → `{"success": false, "error": "old_str matches N locations — must be unique"}` | ⏳ Pending |
-| AC-4 | Overwrite guard | `write_file` with `overwrite=false` on existing file → error, file unchanged | ⏳ Pending |
-| AC-5 | Overwrite default | `write_file` with no `overwrite` param → overwrites (backwards compat) | ⏳ Pending |
-| AC-6 | Binary metadata flag | Fetch of `errors='replace'` file includes `"encoding": "utf-8-replace-fallback"` in metadata | ⏳ Pending |
-| AC-7 | Existing tests pass | All tests pass before and after changes | ⏳ Pending |
+| AC-1 | `str_replace` happy path | Unique `old_str` replaced correctly | ✅ `test_str_replace_happy_path_replaces_unique_match` + dispatcher routing test |
+| AC-2 | `str_replace` not found | `old_str` absent → `ValueError` with `"old_str not found in <relative_id>"` (raise → dispatcher wraps as `{"success": false, "error": ..., "isError": true}`) | ✅ `test_str_replace_not_found_returns_error_with_path` |
+| AC-3 | `str_replace` ambiguous | `old_str` found N>1 times → `ValueError` with `"old_str matches <N> locations in <relative_id> — must be unique"` | ✅ `test_str_replace_ambiguous_returns_count_in_error` |
+| AC-4 | Overwrite guard | `write_file` with `overwrite=false` on existing file → `FileExistsError`, file unchanged | ✅ `test_write_file_overwrite_false_on_existing_file_errors_and_preserves` + `test_write_file_overwrite_false_on_new_file_succeeds` |
+| AC-5 | Overwrite default | `write_file` with no `overwrite` param → overwrites (backwards compat) | ✅ `test_write_file_default_overwrite_replaces_content` + all four pre-existing `apply_patch` Update tests still pass (they implicitly exercise the default-overwrite path through `path.write_text(...)` in `_apply_update_hunks`, but `handle_write_file` itself is also covered) |
+| AC-6 | Binary metadata flag | `handle_fetch` always returns `metadata.encoding`; one of `"utf-8"`, `"utf-8-replace-fallback"`, `"binary-placeholder"` | ✅ `test_fetch_strict_decode_sets_encoding_utf_8` + `test_fetch_replace_fallback_sets_encoding_flag` + `test_fetch_binary_placeholder_sets_encoding_flag` + tightened pre-existing `test_fetch_known_text_suffix_uses_replacement_decoding` and `test_fetch_large_and_binary_behavior` |
+| AC-7 | Existing tests pass | All tests pass before and after changes | ✅ 69 tests pass (54 pre-Phase-4 + 15 new), 1 skipped, 0 failed |
+| AC-8 | Composition watchpoint | `str_replace` uses `validate_path` (same primitive as every other path-taking tool) and does its own audited write; does **not** go through `handle_write_file` so the new overwrite guard cannot accidentally apply to it | ✅ `test_str_replace_path_outside_allowed_root_raises_permission_error`; grep-confirmed `handle_str_replace` body uses `validate_path` + direct `path.write_text` |
+| AC-9 | Dispatcher and schema surface | `str_replace` listed in `tool_definitions`; `write_file` schema advertises `overwrite: boolean` with default `true` | ✅ `test_str_replace_present_in_tool_definitions` + `test_write_file_schema_advertises_overwrite_property` + `test_tools_call_routes_str_replace_through_dispatcher` |
 
 ## 4. Diagnostic Findings
-*To be populated after running the pre-code diagnostic protocol.*
+
+Pre-code diagnostic run on 2026-05-19, after Phase 3 landed and committed (baseline 54 tests, commit `debb4a7`).
+
+### Composition watchpoint resolution — does `str_replace` need its own path?
+- **Composes cleanly with `validate_path`** (the shared primitive that enforces the allowed-root boundary). `str_replace` calls it directly.
+- **Does NOT compose with `handle_write_file`**. If it did, three things would break: (a) double `validate_path` call, (b) `_audit("write_file", ...)` instead of `_audit("str_replace", ...)` — wrong attribution, (c) any future change to `handle_write_file`'s contract (e.g. this phase's `overwrite` guard) would falsely apply to a tool that by definition always edits existing files.
+- **Resolution:** `handle_str_replace` is a self-contained ~30-line handler that uses `validate_path` for path resolution and `path.write_text(...)` for the write. Clean separation, no accidental coupling. AC-8 codifies this with `test_str_replace_path_outside_allowed_root_raises_permission_error` and grep verification.
+
+### Code locations confirmed (pre-edit)
+- `handle_sse_connection` at line 144 — no connection accounting; descope candidate (see "I-8 descope" below).
+- `handle_fetch` at line 988 — strict UTF-8 then fallback paths; no `encoding` metadata key today.
+- `handle_write_file` at line 1011 — unconditional overwrite, no `overwrite` param.
+- `validate_path` at line 1123 — reusable as-is for `str_replace`.
+- `_relative_id` at line 1133 — produces the path string used in audit and error messages.
+
+### Existing test coverage on touched paths (pre-Phase-4)
+- `handle_write_file` overwrite: zero direct coverage.
+- `handle_fetch` strict UTF-8 success: implicit only.
+- `handle_fetch` replace-fallback (text suffix + bad bytes): `test_fetch_known_text_suffix_uses_replacement_decoding` — asserts content; no encoding metadata (key didn't exist).
+- `handle_fetch` binary placeholder: `test_fetch_large_and_binary_behavior` — asserts placeholder text; no encoding metadata.
+- `str_replace`: did not exist.
+
+### I-8 descope — SSE connection tracking
+- Listed in Phase 4 §2 In scope, but **no explicit AC** existed in the AC table.
+- Severity 🟢 Low per the spec's issue register; SSE path has been stable across all three prior phases.
+- Hard to test deterministically without a live HTTP fixture; the current SSE test only verifies handshake.
+- Parallel to Phase 1's `restrict` descope — would have added attack surface (in this case, threading complexity) without delivering a measurable benefit to the user's single-client workflow.
+- **Resolution:** Descope I-8. If a future phase wants it, the recommended shape is a `threading.Lock`-protected class-level counter wrapped in a context manager so the counter mechanics can be unit-tested directly without HTTP. The existing `handle_sse_connection` body remains untouched.
+
+### Reviewer-driven decisions applied
+1. **Encoding metadata: option β (always-present)** — `metadata.encoding` is always one of `"utf-8"`, `"utf-8-replace-fallback"`, `"binary-placeholder"`. Callers can read the value unconditionally rather than checking key presence.
+2. **`str_replace` error shape: option (i) raise `ValueError`** — consistent with `handle_fetch` and other handlers; dispatcher's existing `_tool_response(..., is_error=True)` produces the wire-level `{"success": false, "error": ..., "isError": true}` shape.
+3. **Exact error message strings pinned**:
+   - AC-2: `"old_str not found in <relative_id>"` — `relative_id` comes from `_relative_id()` so the path style matches the rest of the codebase.
+   - AC-3: `"old_str matches <N> locations in <relative_id> — must be unique"` — count integer included; tests `assertIn` against the stable fragments (`"old_str matches"`, `"must be unique"`, `<relative_id>`) so the integer doesn't require an exact format target.
+4. **Version bump 1.5.0 → 1.6.0** — new tool + new param = minor bump.
+5. **`__pycache__` cleanup folded into Phase 4 commit** — `.gitignore` added, tracked `.pyc` removed from index. One-shot housekeeping; not a separate commit.
+
+### Files actually touched in Phase 4
+1. `fileSystemMCP.py`:
+   - `SERVER_VERSION` 1.5.0 → 1.6.0.
+   - `handle_fetch` now sets `encoding = "utf-8" | "utf-8-replace-fallback" | "binary-placeholder"` and includes it in `metadata`.
+   - `handle_write_file` gains `overwrite: bool = True` param; raises `FileExistsError` when `overwrite=False` and target exists. Defaults preserve v1.5.0 behaviour.
+   - New `handle_str_replace` — uses `validate_path`, reads strict UTF-8, counts occurrences, raises pinned errors for not-found and ambiguous cases, audits as `"str_replace"`.
+   - `tool_definitions` gains a `str_replace` entry next to `write_file`, and `write_file`'s `inputSchema.properties` adds `overwrite: boolean` with `default: true`.
+   - Dispatcher: `str_replace` route added; `write_file` route now forwards `overwrite=bool(tool_args.get("overwrite", True))`.
+2. `test_fileSystemMCP.py`:
+   - Two `SERVER_VERSION` assertions bumped to `1.6.0`.
+   - Two pre-existing fetch tests tightened with `assertEqual` on the new `metadata.encoding` key.
+   - New classes `StrReplaceAndWriteOverwriteTests` (9 tests), `FetchEncodingMetadataTests` (3 tests), `StrReplaceToolDefinitionAndDispatchTests` (3 tests).
+3. `README.md` — new `str_replace` section, new `write_file` section explaining `overwrite`, encoding metadata table on `fetch`.
+4. `.gitignore` — new file; `__pycache__/` ignored.
+5. `__pycache__/fileSystemMCP.cpython-314.pyc` — removed from index (file still exists on disk; no longer tracked).
+
+### Post-implementation test suite
+- `python test_fileSystemMCP.py` → **69 tests, 68 passed + 1 skipped, 0 failed**. Delta vs Phase 3: +15 new tests, all green.
+
+### Backwards compatibility
+- All 54 pre-Phase-4 tests pass unmodified (only the two fetch tests gained additional `assertEqual`s on the new metadata key — pre-existing assertions still hold).
+- `handle_write_file` with no `overwrite` param → unconditional overwrite, identical to v1.5.0.
+- `handle_fetch` clients ignoring unknown metadata keys are unaffected.
+- `str_replace` is a net-new tool; no existing contract changed.
 
 ---
 

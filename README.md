@@ -195,6 +195,32 @@ Note: if a client UI only displays `query`, refresh/reconnect the MCP server fir
 
 Files up to 5 MB are returned as text when possible. Directories return a simple sorted listing.
 
+File responses always include `metadata.encoding` so the caller can tell how the bytes were decoded:
+
+| Value | When |
+|---|---|
+| `"utf-8"` | Strict UTF-8 decode succeeded — text is exact. |
+| `"utf-8-replace-fallback"` | File suffix is a known text type (`.md`, `.py`, etc.) but contained bytes that are not valid UTF-8 — text was decoded with `errors="replace"`, so some characters are `�` substitutions. |
+| `"binary-placeholder"` | File is non-text and could not be UTF-8 decoded — `text` is a `"[Binary file: <suffix>]"` placeholder, not the file's bytes. |
+
+### `str_replace`
+
+Surgical single-location string replacement. Arguments:
+
+- `path`: file inside the allowed root
+- `old_str`: exact substring to replace; must occur **exactly once** in the file
+- `new_str`: replacement text
+
+Fails (with an error response) when `old_str` is not present or occurs more than once. The file is read strictly as UTF-8 — `str_replace` does not use the replace-fallback decoder so it never edits corrupted content. Use `apply_patch` for multi-line or context-sensitive edits.
+
+### `write_file`
+
+Writes a UTF-8 text file, creating parent directories as needed. Arguments:
+
+- `path`: target file inside the allowed root
+- `content`: text to write
+- `overwrite` *(optional, default `true`)*: when `false`, fails if the target already exists. The default preserves prior behaviour — pass `overwrite: false` when you want to be explicit about creating a new file without clobbering an existing one.
+
 ### `delete_file`
 
 Arguments:
