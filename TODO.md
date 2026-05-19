@@ -1,5 +1,13 @@
 # TODO
 
+## Resolved in v1.5.0 (Phase 3 — Config & Launcher)
+
+- **T-1** `mcp_config.json` loader — script-adjacent auto-discovery with `--config <path>` explicit override. CamelCase keys (`allowedRoot`, `authToken`, `shellMode`, etc.) map to internal snake_case. Unknown keys are dropped silently for forward-compat; malformed JSON or non-object top-level → clear startup error with path + line/column. `auditLog`, `trashDir`, `backupsDir` accepted as **reserved** — parse without error, do not yet take effect.
+- **T-3** Auth token from config — `authToken` in `mcp_config.json` is honoured by the existing `_request_allowed` path. No new code needed in the handler; `main()` populates `config["auth_token"]` via the same merge as every other key.
+- **Bonus:** `directory` positional is now optional. Set `"allowedRoot": "..."` in the config and the server starts without arguments. CLI positional still wins when provided.
+- **Bonus:** CLI flags refactored to `None`-sentinel defaults (Option A precedence). Precedence ladder is now explicit: env < file < CLI < built-in defaults at the helper layer.
+- **Launcher work (T-2) descoped after diagnostic** — the existing `D:\GitHub\mcp-launchers\RUN chatGPT MCP server.bat` already orchestrates server + ngrok startup; reserved ngrok domain means the ChatGPT-side connector URL is fixed and never needs to be re-read after restarts.
+
 ## Resolved in v1.4.1 (Phase 2 — Patch Correctness)
 
 - **I-3** Silent full-file overwrite — Update sections containing diff markers (`+`/`-`/`@@`) that are not valid unified-diff hunks now raise an explicit `ValueError` instead of silently overwriting the file. Legitimate full-file replacements (no diff markers anywhere) still apply, now with a `warnings` entry. The response always includes a `warnings: []` field. See `HARDENING_SPEC.md` Phase 2.
@@ -12,7 +20,7 @@
 
 ## Next Refinement Pass: Config and Launcher Usability
 
-Current stable baseline: server version `1.4.1`.
+Current stable baseline: server version `1.5.0`.
 
 The MCP v2 connector now exposes the full tool surface after deleting and recreating the ChatGPT connector registration. Treat future schema/tool-name changes as likely requiring a fresh connector registration, not just `refetch_tools=true`.
 

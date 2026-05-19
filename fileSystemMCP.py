@@ -26,7 +26,7 @@ MAX_TIMEOUT_SEC = 300
 MAX_STDOUT_CHARS = 200_000
 MAX_STDERR_CHARS = 200_000
 MAX_FETCH_BYTES = 5 * 1024 * 1024
-SERVER_VERSION = "1.4.1"
+SERVER_VERSION = "1.5.0"
 
 TEXT_SUFFIXES = {
     ".bat", ".cmd", ".css", ".csv", ".env", ".gitignore", ".html", ".ini",
@@ -1144,39 +1144,191 @@ def create_handler(allowed_directory: Path, config: dict | None = None):
     return handler
 
 
+# Mapping from mcp_config.json keys (camelCase) to internal snake_case keys.
+# Reserved keys (audit_log, trash_dir, backups_dir) parse without error this
+# phase but are not yet wired to their consumers — see HARDENING_SPEC.md Phase 3.
+CONFIG_KEY_MAP = {
+    "allowedRoot": "allowed_root",
+    "host": "host",
+    "port": "port",
+    "authToken": "auth_token",
+    "allowedOrigins": "allowed_origins",
+    "blockedCommands": "blocked_commands",
+    "shellMode": "shell_mode",
+    "auditLog": "audit_log",
+    "trashDir": "trash_dir",
+    "backupsDir": "backups_dir",
+}
+
+# Main()-level defaults for keys that don't reach the handler dict (host, port).
+# Handler-side defaults stay in the respective helpers (_shell_mode,
+# _blocked_commands) so direct handler construction in tests keeps working.
+MAIN_DEFAULTS = {"host": "localhost", "port": 8000}
+
+
+def _load_config_file(path: Path) -> dict:
+    """Read mcp_config.json and return its content with keys mapped to snake_case.
+
+    Missing file → empty dict (AC-4 path). Malformed JSON or non-object top
+    level → ValueError with a path-qualified message (AC-3 path). Unknown
+    keys are dropped silently for forward compatibility.
+    """
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Invalid mcp_config.json at {path}: {exc.msg} (line {exc.lineno}, column {exc.colno})"
+        ) from exc
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"Invalid mcp_config.json at {path}: top level must be a JSON object, got {type(raw).__name__}"
+        )
+    mapped = {}
+    for key, value in raw.items():
+        snake = CONFIG_KEY_MAP.get(key)
+        if snake is None:
+            continue
+        mapped[snake] = value
+    return mapped
+
+
+def _env_overrides() -> dict:
+    """Collect env-var overrides for keys that historically supported them.
+
+    Lower precedence than file or CLI; only keys with non-empty env values are
+    returned so they don't shadow file/CLI values in the merge.
+    """
+    overrides: dict = {}
+    auth = os.environ.get("MCP_AUTH_TOKEN")
+    if auth:
+        overrides["auth_token"] = auth
+    shell = os.environ.get("MCP_SHELL_MODE")
+    if shell:
+        overrides["shell_mode"] = shell
+    blocked = os.environ.get("MCP_BLOCKED_COMMANDS")
+    if blocked:
+        items = [s.strip() for s in blocked.split(";") if s.strip()]
+        if items:
+            overrides["blocked_commands"] = items
+    return overrides
+
+
+def _merge_config(file_config: dict, cli_overrides: dict, env_overrides: dict | None = None) -> dict:
+    """Compose final config. Precedence: env < file < CLI.
+
+    Keys whose value is None in any source are treated as 'not set' and do
+    not override lower-precedence sources. The allow_origin / blocked_command
+    action='append' flags default to None at argparse level; an empty list
+    passed via CLI (theoretical, since append cannot produce one directly) is
+    still treated as 'set' and would win over file.
+    """
+    resolved: dict = {}
+    for source in (env_overrides or {}, file_config, cli_overrides):
+        for key, value in source.items():
+            if value is None:
+                continue
+            resolved[key] = value
+    return resolved
+
+
+def _discover_config_path(explicit: str | None) -> Path | None:
+    """Resolve mcp_config.json location.
+
+    Precedence:
+      1. --config <path> if passed (must exist or raises ValueError)
+      2. mcp_config.json next to fileSystemMCP.py (script-adjacent auto-discovery)
+      3. None → no config file (pure defaults; AC-4 path)
+    """
+    if explicit:
+        explicit_path = Path(explicit).resolve()
+        if not explicit_path.exists():
+            raise ValueError(f"--config path does not exist: {explicit_path}")
+        return explicit_path
+    script_adjacent = Path(__file__).resolve().parent / "mcp_config.json"
+    if script_adjacent.exists():
+        return script_adjacent
+    return None
+
+
+def _resolve_allowed_root(positional: str | None, resolved_config: dict) -> str | None:
+    """CLI positional > config['allowed_root'] > None. Caller surfaces the no-root error."""
+    if positional:
+        return positional
+    return resolved_config.get("allowed_root")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Local filesystem MCP server for ChatGPT/Codex-style workflows.")
-    parser.add_argument("directory", help="Directory the server is allowed to access")
-    parser.add_argument("--host", default="localhost", help="Host interface to bind (default: localhost)")
-    parser.add_argument("--port", type=int, default=8000, help="Port to listen on (default: 8000)")
-    parser.add_argument("--auth-token", default=os.environ.get("MCP_AUTH_TOKEN", ""), help="Optional bearer token required for HTTP requests")
-    parser.add_argument("--allow-origin", action="append", default=[], help="Allowed Origin header. May be repeated. Localhost origins are always allowed.")
+    parser.add_argument(
+        "directory",
+        nargs="?",
+        default=None,
+        help="Directory the server is allowed to access. May also be supplied via 'allowedRoot' in mcp_config.json.",
+    )
+    parser.add_argument("--config", default=None, help="Path to mcp_config.json (overrides script-adjacent auto-discovery).")
+    parser.add_argument("--host", default=None, help="Host interface to bind (default: localhost)")
+    parser.add_argument("--port", type=int, default=None, help="Port to listen on (default: 8000)")
+    parser.add_argument("--auth-token", default=None, help="Optional bearer token required for HTTP requests (env: MCP_AUTH_TOKEN)")
+    parser.add_argument("--allow-origin", action="append", default=None, help="Allowed Origin header. May be repeated. Localhost origins are always allowed.")
     parser.add_argument("--blocked-command", action="append", default=None, help="Blocked shell command substring. May be repeated. Defaults block common destructive patterns.")
     parser.add_argument(
         "--shell-mode",
         choices=list(VALID_SHELL_MODES),
-        default=os.environ.get("MCP_SHELL_MODE", "allow"),
+        default=None,
         help="Shell tool exposure: 'allow' (default, current behaviour) or 'disable' (removes the shell tool entirely; recommended for ngrok-exposed deployments).",
     )
     args = parser.parse_args()
 
-    allowed_directory = Path(args.directory).resolve()
-    if not allowed_directory.exists() or not allowed_directory.is_dir():
-        print(f"Error: {allowed_directory} is not a valid directory")
-        sys.exit(1)
+    # Discover and load mcp_config.json. AC-3: malformed or non-object JSON → clear error, exit non-zero.
+    try:
+        config_path = _discover_config_path(args.config)
+        file_config = _load_config_file(config_path) if config_path else {}
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        sys.exit(2)
 
-    print(f"Starting MCP server restricted to: {allowed_directory}")
-    print(f"Server URL: http://{args.host}:{args.port}")
-    print(f"SSE URL for ChatGPT: http://{args.host}:{args.port}/sse/")
-    print(f"Streamable HTTP-style POST URL: http://{args.host}:{args.port}/mcp")
-
-    config = {
+    cli_overrides = {
+        "host": args.host,
+        "port": args.port,
         "auth_token": args.auth_token,
         "allowed_origins": args.allow_origin,
         "blocked_commands": args.blocked_command,
         "shell_mode": args.shell_mode,
     }
-    with MCPHTTPServer((args.host, args.port), create_handler(allowed_directory, config)) as server:
+    resolved = _merge_config(file_config, cli_overrides, _env_overrides())
+
+    # Resolve allowed_root: CLI positional > config['allowed_root'] > error.
+    allowed_root_str = _resolve_allowed_root(args.directory, resolved)
+    if not allowed_root_str:
+        print("Error: no directory provided (pass as positional argument or set 'allowedRoot' in mcp_config.json)")
+        sys.exit(2)
+    allowed_directory = Path(allowed_root_str).resolve()
+    if not allowed_directory.exists() or not allowed_directory.is_dir():
+        print(f"Error: {allowed_directory} is not a valid directory")
+        sys.exit(1)
+
+    # host/port stay at main()-level — never threaded into self.config.
+    host = resolved.get("host", MAIN_DEFAULTS["host"])
+    port = resolved.get("port", MAIN_DEFAULTS["port"])
+
+    # Slim down to what the handler actually needs.
+    handler_config = {
+        "auth_token": resolved.get("auth_token", ""),
+        "allowed_origins": resolved.get("allowed_origins") or [],
+        "blocked_commands": resolved.get("blocked_commands"),
+        "shell_mode": resolved.get("shell_mode", "allow"),
+    }
+
+    print(f"Starting MCP server restricted to: {allowed_directory}")
+    if config_path:
+        print(f"Loaded config from: {config_path}")
+    print(f"Server URL: http://{host}:{port}")
+    print(f"SSE URL for ChatGPT: http://{host}:{port}/sse/")
+    print(f"Streamable HTTP-style POST URL: http://{host}:{port}/mcp")
+
+    with MCPHTTPServer((host, port), create_handler(allowed_directory, handler_config)) as server:
         print("Server started. Use Ctrl+C to stop.")
         try:
             server.serve_forever()

@@ -1,10 +1,10 @@
 # FileSystem-MCP-for-GPT — Hardening Spec
 
 ## Header Block
-- **Status:** Phases 1 ✅ + 2 ✅ complete — Phases 3–4 spec drafted, implementation pending
+- **Status:** Phases 1 ✅ + 2 ✅ + 3 ✅ complete — Phase 4 spec drafted, implementation pending
 - **Date:** 2026-05-19
 - **Repo:** `D:\GitHub\FileSystem-MCP-for-GPT`
-- **Baseline version:** `1.3.1` → `1.4.0` (Phase 1) → current `1.4.1` (Phase 2)
+- **Baseline version:** `1.3.1` → `1.4.0` (Phase 1) → `1.4.1` (Phase 2) → current `1.5.0` (Phase 3)
 - **Review level:** Full — security changes, correctness fixes, and new config surface all require careful review before commit
 - **Source:** Combined from independent review findings + existing `TODO.md`
 
@@ -48,7 +48,7 @@ All items from both the independent review and `TODO.md`, merged and ranked.
 |-------|------|-------|-------|--------|
 | 1 | Security Hardening | Shell sandbox escape + blocked command bypass | I-1, I-2 | ✅ Complete (v1.4.0) |
 | 2 | Patch Correctness | Hunk detection silent failure + whitespace mismatch | I-3, I-4 | ✅ Complete (v1.4.1) |
-| 3 | Config & Launcher | `mcp_config.json` + ngrok URL + auth token | T-1, T-2, T-3 | ⏳ Spec drafted |
+| 3 | Config & Launcher | `mcp_config.json` + auth token (launcher work descoped) | T-1, T-3 | ✅ Complete (v1.5.0) |
 | 4 | Quality & Tools | `str_replace`, overwrite guard, binary metadata, SSE, tests | I-5, I-6, I-7, I-8, T-4 | ⏳ Spec drafted |
 
 ---
@@ -378,24 +378,26 @@ Pre-code diagnostic run on 2026-05-19, after Phase 1 landed (baseline 28 tests).
 
 **Answers:** Can the server be configured and started without editing CLI flags in a batch file every time?
 
-Moves FROM → all settings in CLI args, ngrok URL not surfaced automatically
-Moves TO → `mcp_config.json` drives settings, CLI overrides, launcher prints ready-to-paste connector URL
+Moves FROM → all settings in CLI args
+Moves TO → `mcp_config.json` drives settings, CLI overrides, no batch-file edits needed for routine changes
 
 ## 2. Scope
 
 ### In scope
 - `mcp_config.json` schema and loader — all fields from TODO T-1
 - `shellMode` in config (aligns with Phase 1 `--shell-mode`)
-- CLI args continue to override config values
-- Backwards compatibility with current CLI-only invocation
-- Launcher polish — ngrok API query, retry loop, printed connector URL
+- CLI args continue to override config values (Option A: None sentinels for all overridable flags)
+- `directory` positional becomes optional (`nargs="?"`); config supplies `allowedRoot` when omitted
+- Backwards compatibility with current CLI-only invocation (no config file present → identical v1.4.1 behaviour)
 - Auth token loaded from config (no-auth remains valid default)
+- Script-adjacent auto-discovery: `mcp_config.json` next to `fileSystemMCP.py`, with `--config <path>` explicit override
 
 ### Out of scope
 - Git tools
 - Backup/restore tools
 - Write allow rules
 - Any changes to tool implementations
+- **Launcher work (AC-5, AC-6) — descoped after diagnostic**. The existing `D:\GitHub\mcp-launchers\RUN chatGPT MCP server.bat` (see §5 Diagnostic Findings) already orchestrates server + ngrok startup. The user's ngrok setup uses a reserved/static public URL fixed once in ChatGPT's connector config, so automated URL detection and retry-on-ngrok solve a problem that does not exist in this workflow. `_audit`/`_quarantine_path` constants (`auditLog`, `trashDir`, `backupsDir`) are also out of scope this phase — accepted in JSON schema as **reserved keys** that parse without error but do not take effect until a later phase.
 
 ## 3. Config Schema (`mcp_config.json`)
 
@@ -420,17 +422,70 @@ All fields optional — absence falls back to current defaults.
 
 | # | Gate | Acceptance Condition | Status |
 |---|------|---------------------|--------|
-| AC-1 | Config loads | `mcp_config.json` present → settings applied | ⏳ Pending |
-| AC-2 | CLI overrides config | CLI `--port 9000` overrides `"port": 8000` in config | ⏳ Pending |
-| AC-3 | Invalid config handled | Malformed JSON → clear startup error, server does not start | ⏳ Pending |
-| AC-4 | No config = current behaviour | Absence of `mcp_config.json` = identical behaviour to `1.3.1` | ⏳ Pending |
-| AC-5 | Launcher prints URL | After ngrok starts, launcher prints exact `https://xxxx.ngrok-free.app/sse/` | ⏳ Pending |
-| AC-6 | Launcher retries | If ngrok not ready, retries for up to 10s at 1s intervals | ⏳ Pending |
-| AC-7 | Auth from config | `authToken` in config applied; missing key = no auth | ⏳ Pending |
-| AC-8 | Existing tests pass | All tests pass before and after changes | ⏳ Pending |
+| AC-1 | Config loads | `mcp_config.json` present → settings applied | ✅ `test_load_config_file_parses_camelcase_keys_to_snake_case` + `test_merge_config_file_overrides_default` |
+| AC-2 | CLI overrides config | CLI `--port 9000` overrides `"port": 8000` in config | ✅ `test_merge_config_cli_overrides_file` + `test_merge_config_none_cli_does_not_override_file` |
+| AC-3 | Invalid config handled | Malformed JSON → clear startup error, server does not start | ✅ `test_load_config_file_raises_on_invalid_json` + `test_load_config_file_raises_on_non_object_top_level`; live CLI smoke verified exit code 2 |
+| AC-4 | No config = current behaviour | Absence of `mcp_config.json` = identical behaviour to v1.4.1 | ✅ `test_load_config_file_returns_empty_when_missing` + `test_no_config_file_equivalent_to_v1_4_1_handler_state` |
+| AC-5 | Launcher prints URL | After ngrok starts, launcher prints exact `https://xxxx.ngrok-free.app/sse/` | 🚫 Descoped — reserved ngrok domain fixes the URL in ChatGPT's connector config; automated detection unnecessary |
+| AC-6 | Launcher retries | If ngrok not ready, retries for up to 10s at 1s intervals | 🚫 Descoped — same reason as AC-5 |
+| AC-7 | Auth from config | `authToken` in config applied; missing key = no auth | ✅ `test_auth_token_from_config_blocks_unauthenticated_request` + pre-existing `_request_allowed` behaviour (unchanged from v1.4.1) |
+| AC-8 | Existing tests pass | All tests pass before and after changes | ✅ 54 tests pass (35 pre-Phase-3 + 19 new), 1 skipped, 0 failed |
+| AC-9 | Reserved keys parse cleanly | `auditLog`, `trashDir`, `backupsDir` accepted in JSON without error; do not yet affect behaviour | ✅ `test_load_config_file_accepts_reserved_keys_without_error` |
+| AC-10 | `allowedRoot` composition | Positional `directory` arg wins; config supplies root when positional omitted; neither set → clear error | ✅ `test_resolve_allowed_root_positional_wins` + `test_resolve_allowed_root_config_used_when_positional_absent` + `test_resolve_allowed_root_returns_none_when_neither_set`; live CLI smoke verified |
+| AC-11 | `shell_mode` single read path | Phase 1's `_shell_mode()` keeps `self.config['shell_mode']` as its only source. No parallel reader introduced. | ✅ Grep-confirmed — only call sites unchanged from Phase 1; `main()` populates the dict via `_merge_config` |
 
 ## 5. Diagnostic Findings
-*To be populated after running the pre-code diagnostic protocol.*
+
+Pre-code diagnostic run on 2026-05-19, after Phase 2 landed and committed (baseline 35 tests, commit `9735bba`).
+
+### Watchpoint 1 — `shell_mode` composition risk
+- **Pre-Phase-3 state:** every config consumer in `fileSystemMCP.py` already read from `self.config.get(...)` on a single dict. Six call sites — `_request_allowed` (allowed_origins, auth_token), `handle_status` (auth_token, allowed_origins), `_blocked_commands`, `_shell_mode` — all share the same dict.
+- **Resolution:** Phase 3 added only an *upstream* loader/merger. The JSON file becomes a `file_config` dict; `_merge_config` produces a `resolved` dict; `main()` slims it into the same `config` argument `MCPSSEHandler` already accepted. **Zero changes to `_shell_mode()`, `_blocked_commands()`, `_request_allowed()`, or `handle_status()`.** Phase 1's plumbing remained the contract; Phase 3 just fed it. AC-11 codifies this.
+
+### Watchpoint 2 — Launcher surprise
+- The existing launcher at `D:\GitHub\mcp-launchers\RUN chatGPT MCP server.bat` is a single 86-line batch file in a separate folder. It already orchestrates server + ngrok in two cmd windows with Python detection and ngrok presence checks. It does **not** query the ngrok local API or print a ready-to-paste connector URL — but it does not need to: the user's ngrok configuration uses a reserved/static public URL fixed once in ChatGPT's connector config.
+- **Resolution:** AC-5 and AC-6 descoped. No new launcher file shipped. The existing `.bat` stays untouched. Documented in §2 Scope and in the AC table.
+
+### Code locations confirmed (pre-edit)
+- `main()` at line 1147; CLI parser at 1148–1161; config dict construction at 1173–1178; constructor `MCPSSEHandler.__init__` at 57 storing the dict on `self.config`.
+- Existing `self.config` read sites: lines 77 (`allowed_origins`), 86 (`auth_token`), 651 (`auth_token` in status), 662 (`allowed_origins` in status), 1065 (`blocked_commands` in `_blocked_commands`), 1074 (`shell_mode` in `_shell_mode`).
+- Existing CLI defaults that needed Option A None-sentinel refactor: `--host` (`"localhost"`), `--port` (`8000`), `--auth-token` (`os.environ.get(..., "")`), `--allow-origin` (`[]`), `--blocked-command` (`None` already), `--shell-mode` (`os.environ.get(..., "allow")`).
+- **No launcher script, no JSON config file, no test for `main()` / CLI / config-load existed in the repo.** All Phase 3 test coverage is net-new.
+
+### Files actually touched in Phase 3
+1. `fileSystemMCP.py`:
+   - `SERVER_VERSION` `1.4.1` → `1.5.0`.
+   - Added module-level constants `CONFIG_KEY_MAP` (camelCase → snake_case, including reserved keys) and `MAIN_DEFAULTS` (host/port only — kept out of the handler dict).
+   - Added `_load_config_file(path)`, `_env_overrides()`, `_merge_config(file, cli, env=None)`, `_discover_config_path(explicit)`, `_resolve_allowed_root(positional, resolved)` — all pure functions, all directly unit-testable.
+   - `main()` refactored: `argparse` now uses `default=None` for every overridable flag and `nargs="?"` on the positional; discovers/loads config inside a try/except that prints a clear error and `sys.exit(2)` on malformed input; merges file/CLI/env into a single `resolved` dict; resolves `allowed_root` via the new helper; passes `host`/`port` directly to `MCPHTTPServer(...)` (not into the handler config dict per reviewer watchpoint); the handler config remains the same four keys it had in v1.4.1.
+2. `test_fileSystemMCP.py`:
+   - Two `SERVER_VERSION` assertions bumped to `1.5.0`.
+   - Imports extended to pull in the four new public helpers.
+   - New class `ConfigLoaderAndMergeTests` (17 tests) covering loader happy-path, camelCase mapping, reserved keys, unknown-key tolerance, both AC-3 failure paths, full precedence matrix, `_resolve_allowed_root` (all three branches), the v1.4.1 equivalence check, and auth-via-config.
+   - New class `ConfigEnvOverrideTests` (2 tests) covering `_env_overrides()` with a finally-protected env swap helper so the suite stays hermetic.
+3. `README.md` — flags list updated; added a **Config file** section with auto-discovery rules, precedence ladder, schema example, and an explicit note that `auditLog`/`trashDir`/`backupsDir` are **reserved** and currently have no effect.
+4. **No new launcher file shipped.**
+
+### Reviewer-driven decisions applied
+1. **Option A (None sentinels) for AC-2 precedence** — every overridable flag's argparse `default=None`. `_merge_config` ignores any key whose value is `None` in any source, so CLI silence means file/env/default win.
+2. **`auditLog`/`trashDir`/`backupsDir` accepted as reserved keys** — present in `CONFIG_KEY_MAP`, parsed without error, but their consumers (`_audit`, `_quarantine_path`) still use the existing constants. README explicitly documents them as reserved.
+3. **Script-adjacent auto-discovery with explicit `--config` override** — `Path(__file__).parent / "mcp_config.json"` is checked when no `--config` is passed. CWD is never consulted; no surprise pickups from where the user happens to be when launching.
+4. **`host`/`port` resolved at `main()` level, not threaded into `self.config`** — the handler doesn't need to know its bind address; that's `main()`'s concern. `_merge_config` produces a broader `resolved` dict; `main()` extracts host/port into local variables and slims the rest into the four-key handler config.
+5. **AC-5 and AC-6 descoped** with rationale recorded above (reserved ngrok domain).
+
+### Live CLI smoke tests run after implementation
+- `python fileSystemMCP.py --help` — shows `[--config CONFIG]`, `[--shell-mode {allow,disable}]`, `[directory]` (square-bracketed, confirming optional).
+- `python fileSystemMCP.py --config nonexistent.json .` → `Error: --config path does not exist: ...`, exit 2.
+- `python fileSystemMCP.py --config <malformed-json-file> .` → `Error: Invalid mcp_config.json at <path>: Expecting property name enclosed in double quotes (line 1, column 3)`, exit 2.
+- `python fileSystemMCP.py` (no directory, no config) → `Error: no directory provided (pass as positional argument or set 'allowedRoot' in mcp_config.json)`, exit 2.
+
+### Backwards compatibility
+- `python fileSystemMCP.py D:\GitHub` (the existing launcher's invocation pattern) behaves identically to v1.4.1: no config file picked up unless one is placed next to `fileSystemMCP.py`; CLI value populates the same `config["..."]` keys the handler has always read.
+- All 35 pre-Phase-3 tests pass unmodified.
+- Env vars (`MCP_AUTH_TOKEN`, `MCP_SHELL_MODE`, `MCP_BLOCKED_COMMANDS`) continue to work, just with explicit lowest-precedence handling instead of being CLI-default-only.
+
+### Post-implementation test suite
+- `python test_fileSystemMCP.py` → **54 tests, 53 passed + 1 skipped, 0 failed**. Delta vs Phase 2: +19 new tests, all green.
 
 ---
 

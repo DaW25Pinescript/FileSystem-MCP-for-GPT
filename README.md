@@ -43,9 +43,12 @@ SSE URL for ChatGPT: http://localhost:8000/sse/
 Server started. Use Ctrl+C to stop.
 ```
 
+The `directory` positional argument is optional — if omitted, the server looks for `allowedRoot` in `mcp_config.json` (see [Config file](#config-file) below).
+
 Optional flags:
 
 ```text
+--config PATH               Path to mcp_config.json (overrides script-adjacent auto-discovery)
 --host HOST                 Bind interface, default localhost
 --port PORT                 Listen port, default 8000
 --auth-token TOKEN          Optional bearer token required for requests
@@ -55,6 +58,42 @@ Optional flags:
 ```
 
 The legacy `/sse/` endpoint remains available. A modern-style POST endpoint is also available at `/mcp`.
+
+## Config file
+
+`mcp_config.json` lets you keep settings out of the launcher batch file. Every key is optional; absence falls back to the same defaults as the CLI flags.
+
+**Auto-discovery:** the server looks for `mcp_config.json` in the directory containing `fileSystemMCP.py` (script-adjacent). Override the location with `--config <path>`.
+
+**Precedence (highest wins):**
+
+1. CLI flags
+2. `mcp_config.json` values
+3. Environment variables (`MCP_AUTH_TOKEN`, `MCP_SHELL_MODE`, `MCP_BLOCKED_COMMANDS`)
+4. Built-in defaults
+
+A missing file is not an error — the server starts on built-in defaults. A malformed file (invalid JSON or non-object top level) prints a clear startup error and exits non-zero.
+
+**Schema example:**
+
+```json
+{
+  "allowedRoot": "D:\\GitHub",
+  "host": "localhost",
+  "port": 8000,
+  "authToken": "",
+  "allowedOrigins": [],
+  "blockedCommands": [],
+  "shellMode": "allow",
+  "auditLog": ".mcp_audit.log",
+  "trashDir": ".mcp_trash",
+  "backupsDir": ".mcp_backups"
+}
+```
+
+`auditLog`, `trashDir`, and `backupsDir` are **reserved** — they parse without error but currently have no effect; their consumers are still backed by the built-in constants. They are accepted in the schema now so files written today remain valid when those keys are wired in a later phase.
+
+Unknown keys are dropped silently for forward compatibility.
 
 ## Expose to ChatGPT
 
